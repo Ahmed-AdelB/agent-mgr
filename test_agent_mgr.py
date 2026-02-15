@@ -2381,3 +2381,151 @@ class TestAutoLoopWithProcessController:
         with patch.object(mgr, "sync_github_to_inbox") as mock_sync:
             mgr.run_auto_loop(interval=1)
             mock_sync.assert_called_once()
+
+
+# ===========================================================================
+# TestConfigConsistency
+# ===========================================================================
+
+class TestConfigConsistency:
+    """Tests that config.py values are internally consistent."""
+
+    def test_agent_label_matches_role_label(self):
+        """The label field must match role_label so filtering uses labels
+        that actually exist in the repo (created by labels-setup)."""
+        from config import AGENTS
+        for agent_name, cfg in AGENTS.items():
+            assert cfg["label"] == cfg["role_label"], (
+                f"Agent '{agent_name}' has label={cfg['label']!r} but "
+                f"role_label={cfg['role_label']!r} -- they must match"
+            )
+
+    def test_agent_labels_are_in_all_labels(self):
+        """Every agent filter label must exist in ALL_LABELS so
+        labels-setup creates it."""
+        from config import AGENTS, ALL_LABELS
+        all_label_names = {name for name, _, _ in ALL_LABELS}
+        for agent_name, cfg in AGENTS.items():
+            assert cfg["label"] in all_label_names, (
+                f"Agent '{agent_name}' label {cfg['label']!r} is not in ALL_LABELS"
+            )
+            assert cfg["role_label"] in all_label_names, (
+                f"Agent '{agent_name}' role_label {cfg['role_label']!r} is not in ALL_LABELS"
+            )
+
+    def test_no_localkimi_in_agents(self):
+        """The config should not have a 'localkimi' key -- only 'kimi'."""
+        from config import AGENTS
+        assert "localkimi" not in AGENTS
+        assert "kimi" in AGENTS
+
+    def test_all_agents_have_required_keys(self):
+        """Every agent config must have label, role_label, and description."""
+        from config import AGENTS
+        required_keys = {"label", "role_label", "description"}
+        for agent_name, cfg in AGENTS.items():
+            missing = required_keys - set(cfg.keys())
+            assert not missing, (
+                f"Agent '{agent_name}' is missing keys: {missing}"
+            )
+
+
+# ===========================================================================
+# TestAutoLoopGracefulShutdown
+# ===========================================================================
+
+class TestAutoLoopGracefulShutdown:
+    """Tests that run_auto_loop exits cleanly on KeyboardInterrupt
+    during work steps (not just during sleep)."""
+
+    def _make_manager(self):
+        mock_gh = MagicMock(spec=GitHubConnector)
+        mock_gh.repo = "owner/repo"
+        from auto_manager import AutoManager
+        mgr = AutoManager(mock_gh)
+        return mgr, mock_gh
+
+    @patch("auto_manager.ProcessController")
+    @patch("auto_manager.time.sleep")
+    @patch("auto_manager._log_decision")
+    def test_keyboard_interrupt_during_health_check(self, mock_log, mock_sleep, mock_pc_cls):
+        """Auto loop exits cleanly if KeyboardInterrupt arrives during health_check."""
+        mgr, mock_gh = self._make_manager()
+
+        # Make list_issues raise KeyboardInterrupt (simulating Ctrl+C during health_check)
+        mock_gh.list_issues.side_effect = KeyboardInterrupt()
+
+        # Should not raise -- exits cleanly
+        mgr.run_auto_loop(interval=1)
+
+        # Sleep should never be reached since interrupt happened during work
+        mock_sleep.assert_not_called()
+
+    @patch("auto_manager.ProcessController")
+    @patch("auto_manager.time.sleep")
+    @patch("auto_manager._log_decision")
+    def test_keyboard_interrupt_during_replenish(self, mock_log, mock_sleep, mock_pc_cls):
+        """Auto loop exits cleanly if KeyboardInterrupt arrives during replenish_queues."""
+        mgr, mock_gh = self._make_manager()
+
+        # Health check succeeds, but replenish (which calls list_issues) raises
+        call_count = [0]
+        def list_issues_side_effect(**kwargs):
+            call_count[0] += 1
+            # Let the first few calls through (health_check uses list_issues)
+            # Then raise on a later call (during replenish)
+            if call_count[0] > 10:
+                raise KeyboardInterrupt()
+            return []
+
+        mock_gh.list_issues.side_effect = list_issues_side_effect
+        mock_gh.get_comments.return_value = []
+        mock_gh.list_recently_closed.return_value = []
+
+        mock_pc = MagicMock()
+        mock_pc.check_hetzner_connectivity.return_value = False
+        mock_pc_cls.return_value = mock_pc
+
+        # Should not raise
+        mgr.run_auto_loop(interval=1)
+
+
+# ===========================================================================
+# TestDirectiveLabelDeduplication
+# ===========================================================================
+
+class TestDirectiveLabelDeduplication:
+    """Tests that directive() does not pass duplicate labels when creating issues."""
+
+    def _make_manager(self):
+        mock_gh = MagicMock(spec=GitHubConnector)
+        mock_gh.repo = "owner/repo"
+        from auto_manager import AutoManager
+        mgr = AutoManager(mock_gh)
+        return mgr, mock_gh
+
+    @patch("auto_manager._log_decision")
+    def test_directive_creates_issue_without_duplicate_labels(self, mock_log):
+        """When creating a directive issue, labels list should not contain duplicates."""
+        mgr, mock_gh = self._make_manager()
+        mock_gh.list_issues.return_value = []
+        mock_gh.create_issue.return_value = Issue(
+            number=100, title="Directive", state="OPEN", body="",
+            labels=[], url="", created_at="", updated_at=""
+        )
+
+        mgr.directive("researcher", "Focus on Arabic papers")
+
+        mock_gh.create_issue.assert_called_once()
+        call_kwargs = mock_gh.create_issue.call_args
+        labels_passed = call_kwargs[1].get("labels", []) if call_kwargs[1] else []
+        if not labels_passed and len(call_kwargs[0]) > 2:
+            labels_passed = call_kwargs[0][2] if len(call_kwargs[0]) > 2 else []
+
+        # No duplicates
+        assert len(labels_passed) == len(set(labels_passed)), (
+            f"Duplicate labels found: {labels_passed}"
+        )
+        # Should contain role_label and status:ready
+        assert "role:researcher" in labels_passed
+        assert "status:ready" in labels_passed

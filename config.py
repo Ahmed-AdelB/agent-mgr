@@ -17,21 +17,29 @@ REPO = "Ahmed-AdelB/ummro"
 MANAGER_GITHUB_USER = "Ahmed-AdelB"
 
 # Agent definitions
+#
+# "label" is the primary label used to filter issues belonging to this agent.
+# It MUST match an actual label that exists in the repository.  The
+# labels-setup command creates "role:researcher", "role:builder", "role:kimi"
+# via ALL_LABELS below, so we use those as the filter labels too.
+#
+# "role_label" is kept as a semantic alias for assignment operations
+# (currently identical to "label").
 AGENTS: dict[str, dict] = {
     "researcher": {
-        "label": "research",
+        "label": "role:researcher",
         "role_label": "role:researcher",
         "description": "Deep research, web searches, paper analysis, competition analysis",
         "tools": ["Claude Code", "Gemini CLI", "NVIDIA NIM", "WebSearch", "Kimi CLI"],
     },
     "builder": {
-        "label": "builder",
+        "label": "role:builder",
         "role_label": "role:builder",
         "description": "Implementation, coding, testing, PR creation",
         "tools": ["Claude Code", "Gemini CLI", "NVIDIA NIM", "GitHub CLI"],
     },
     "kimi": {
-        "label": "kimi",
+        "label": "role:kimi",
         "role_label": "role:kimi",
         "description": "Strategic research via Kimi CLI ($199 Moonshot plan)",
         "tools": ["Kimi CLI", "NVIDIA NIM"],
@@ -56,7 +64,7 @@ STATUS_LABELS = [
 ROLE_LABELS = [
     ("role:builder", "5319E7", "Assigned to Builder agent"),
     ("role:researcher", "0ABFBC", "Assigned to Researcher agent"),
-    ("role:kimi", "00BCD4", "Assigned to localkimi agent"),
+    ("role:kimi", "00BCD4", "Assigned to Kimi agent"),
 ]
 
 # All standard labels to create
@@ -70,7 +78,7 @@ ALL_LABELS = [
     ("status:rejected", "B60205", "Rejected, needs revision"),
     ("role:builder", "5319E7", "Assigned to Builder agent"),
     ("role:researcher", "0ABFBC", "Assigned to Researcher agent"),
-    ("role:kimi", "00BCD4", "Assigned to localkimi agent"),
+    ("role:kimi", "00BCD4", "Assigned to Kimi agent"),
     ("qa:passed", "2EA44F", "Automated QA passed"),
     ("qa:failed", "CB2431", "Automated QA failed"),
 ]

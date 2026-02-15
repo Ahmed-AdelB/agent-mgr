@@ -115,7 +115,7 @@ def _agent_display_name(agent: str) -> str:
     names: dict[str, str] = {
         "researcher": "Researcher",
         "builder": "Builder",
-        "localkimi": "localkimi",
+        "kimi": "Kimi",
     }
     return names.get(agent, agent)
 
@@ -333,7 +333,7 @@ def _extract_role(issue: dict[str, Any]) -> str:
     role_map: dict[str, str] = {
         "role:builder": "builder",
         "role:researcher": "researcher",
-        "role:kimi": "localkimi",
+        "role:kimi": "kimi",
     }
     for lbl in issue.get("labels", []):
         name = lbl.get("name", "")
@@ -377,7 +377,7 @@ def _role_label_for_agent(agent: str) -> str | None:
     mapping: dict[str, str] = {
         "researcher": "role:researcher",
         "builder": "role:builder",
-        "localkimi": "role:kimi",
+        "kimi": "role:kimi",
     }
     return mapping.get(agent)
 
@@ -395,7 +395,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  python3 agent_mgr.py health\n"
             "  python3 agent_mgr.py queue researcher\n"
             "  python3 agent_mgr.py assign builder 489\n"
-            '  python3 agent_mgr.py directive localkimi "Prioritize Arabic papers"\n'
+            '  python3 agent_mgr.py directive kimi "Prioritize Arabic papers"\n'
             "  python3 agent_mgr.py auto\n"
             "  python3 agent_mgr.py labels-setup\n"
         ),

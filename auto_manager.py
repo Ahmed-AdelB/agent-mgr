@@ -431,7 +431,9 @@ class AutoManager:
                 "Posted directive to %s on #%d", agent, target["number"]
             )
         else:
-            # No in-progress issue -- create one
+            # No in-progress issue -- create one.
+            # Use only the role_label (avoids duplicate since label and
+            # role_label are now identical).
             new_issue = self.gh.create_issue(
                 title=f"[Directive] {agent}: {message[:80]}",
                 body=(
@@ -441,7 +443,7 @@ class AutoManager:
                     f"*Auto-created by auto_manager because {agent} had no "
                     f"in-progress task.*"
                 ),
-                labels=[cfg["label"], cfg["role_label"], "status:ready"],
+                labels=[cfg["role_label"], "status:ready"],
             )
             logger.info(
                 "Created directive issue #%s for %s",
@@ -938,7 +940,7 @@ class AutoManager:
                 lines.append("")
                 lines.append(
                     f"1. Check issues: `gh issue list --repo {REPO} "
-                    f"--label {cfg['label']} --state open`"
+                    f"--label {cfg['role_label']} --state open`"
                 )
                 lines.append("2. Comment on issue when starting")
                 lines.append("3. Reference issue # in commits")
@@ -981,6 +983,9 @@ class AutoManager:
 
         Sleeps *interval* seconds between cycles.  Handles rate-limit and
         network errors gracefully by logging and continuing.
+
+        KeyboardInterrupt is caught both during work steps and during
+        sleep, ensuring a clean shutdown message in all cases.
         """
         cycle = 0
         logger.info(
@@ -988,103 +993,108 @@ class AutoManager:
         )
 
         while True:
-            cycle += 1
-            cycle_start = time.monotonic()
-            logger.info("--- Auto-loop cycle #%d ---", cycle)
-
-            # 1. Health check
             try:
-                health = self.health_check()
-                for agent_name, info in health.items():
-                    if info["status"] in ("stale", "dead"):
-                        logger.warning(
-                            "ALERT: %s is %s (last: %s)",
-                            agent_name,
-                            info["status"],
-                            info["last_comment"],
-                        )
-            except Exception as exc:
-                logger.error("Health check cycle error: %s", exc)
+                cycle += 1
+                cycle_start = time.monotonic()
+                logger.info("--- Auto-loop cycle #%d ---", cycle)
 
-            # 2. Process controller check
-            try:
-                pc = ProcessController()
-                reachable = pc.check_hetzner_connectivity()
-                if not reachable:
-                    logger.warning(
-                        "ALERT: Hetzner server is unreachable"
-                    )
-                else:
-                    kimi_count = pc.count_kimi_sessions()
-                    if kimi_count == 0:
+                # 1. Health check
+                try:
+                    health = self.health_check()
+                    for agent_name, info in health.items():
+                        if info["status"] in ("stale", "dead"):
+                            logger.warning(
+                                "ALERT: %s is %s (last: %s)",
+                                agent_name,
+                                info["status"],
+                                info["last_comment"],
+                            )
+                except Exception as exc:
+                    logger.error("Health check cycle error: %s", exc)
+
+                # 2. Process controller check
+                try:
+                    pc = ProcessController()
+                    reachable = pc.check_hetzner_connectivity()
+                    if not reachable:
                         logger.warning(
-                            "ALERT: No active Kimi sessions on Hetzner"
+                            "ALERT: Hetzner server is unreachable"
                         )
                     else:
-                        logger.info(
-                            "Hetzner OK: %d active Kimi session(s)",
-                            kimi_count,
-                        )
-            except Exception as exc:
-                logger.error("Process controller cycle error: %s", exc)
+                        kimi_count = pc.count_kimi_sessions()
+                        if kimi_count == 0:
+                            logger.warning(
+                                "ALERT: No active Kimi sessions on Hetzner"
+                            )
+                        else:
+                            logger.info(
+                                "Hetzner OK: %d active Kimi session(s)",
+                                kimi_count,
+                            )
+                except Exception as exc:
+                    logger.error("Process controller cycle error: %s", exc)
 
-            # 3. Sync GitHub to INBOX.md
-            try:
-                self.sync_github_to_inbox()
-            except Exception as exc:
-                logger.error("INBOX sync cycle error: %s", exc)
+                # 3. Sync GitHub to INBOX.md
+                try:
+                    self.sync_github_to_inbox()
+                except Exception as exc:
+                    logger.error("INBOX sync cycle error: %s", exc)
 
-            # 4. Prevent unauthorized closes
-            try:
-                self.prevent_unauthorized_closes()
-            except Exception as exc:
-                logger.error("Close prevention cycle error: %s", exc)
+                # 4. Prevent unauthorized closes
+                try:
+                    self.prevent_unauthorized_closes()
+                except Exception as exc:
+                    logger.error("Close prevention cycle error: %s", exc)
 
-            # 5. Replenish queues
-            try:
-                self.replenish_queues()
-            except Exception as exc:
-                logger.error("Replenish cycle error: %s", exc)
+                # 5. Replenish queues
+                try:
+                    self.replenish_queues()
+                except Exception as exc:
+                    logger.error("Replenish cycle error: %s", exc)
 
-            # 6. Check dependencies
-            try:
-                self.check_dependencies()
-            except Exception as exc:
-                logger.error("Dependency check cycle error: %s", exc)
+                # 6. Check dependencies
+                try:
+                    self.check_dependencies()
+                except Exception as exc:
+                    logger.error("Dependency check cycle error: %s", exc)
 
-            # 7. Nudge stale
-            try:
-                self.nudge_stale()
-            except Exception as exc:
-                logger.error("Nudge cycle error: %s", exc)
+                # 7. Nudge stale
+                try:
+                    self.nudge_stale()
+                except Exception as exc:
+                    logger.error("Nudge cycle error: %s", exc)
 
-            # 8. Auto-review needs-review items
-            try:
-                review_items = self.review_queue()
-                for item in review_items:
-                    try:
-                        self.auto_review(item["number"])
-                    except Exception as exc:
-                        logger.error(
-                            "Auto-review failed for #%d: %s",
-                            item["number"],
-                            exc,
-                        )
-            except Exception as exc:
-                logger.error("Review queue cycle error: %s", exc)
+                # 8. Auto-review needs-review items
+                try:
+                    review_items = self.review_queue()
+                    for item in review_items:
+                        try:
+                            self.auto_review(item["number"])
+                        except Exception as exc:
+                            logger.error(
+                                "Auto-review failed for #%d: %s",
+                                item["number"],
+                                exc,
+                            )
+                except Exception as exc:
+                    logger.error("Review queue cycle error: %s", exc)
 
-            elapsed = time.monotonic() - cycle_start
-            logger.info(
-                "Cycle #%d completed in %.1fs. Sleeping %ds...",
-                cycle,
-                elapsed,
-                interval,
-            )
+                elapsed = time.monotonic() - cycle_start
+                logger.info(
+                    "Cycle #%d completed in %.1fs. Sleeping %ds...",
+                    cycle,
+                    elapsed,
+                    interval,
+                )
 
-            try:
-                time.sleep(interval)
+                try:
+                    time.sleep(interval)
+                except KeyboardInterrupt:
+                    logger.info("Auto-loop interrupted by user. Exiting.")
+                    break
+
             except KeyboardInterrupt:
-                logger.info("Auto-loop interrupted by user. Exiting.")
+                logger.info("Auto-loop interrupted during cycle #%d. Exiting cleanly.", cycle)
                 break
 
     # ==================================================================
@@ -1106,7 +1116,7 @@ class AutoManager:
     ) -> list[dict[str, Any]]:
         """Fetch open issues for *agent*, optionally filtered by *status*.
 
-        Uses the agent's primary label (e.g. 'research', 'builder') and
+        Uses the agent's primary label (e.g. 'role:researcher') and
         an optional status label for filtering.
         """
         cfg = AGENTS[agent]

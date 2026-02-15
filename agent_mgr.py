@@ -11,9 +11,13 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
+import signal
 import sys
 import time
 from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from typing import Any
 
 from config import (
@@ -296,20 +300,36 @@ def cmd_directive(gh: GitHubConnector, agent: str, message: str) -> None:
     print(green(f"Directive posted to #{issue_number} for {_agent_display_name(agent)}."))
 
 
-def cmd_auto(gh: GitHubConnector) -> None:
+def cmd_auto(gh: GitHubConnector, dry_run: bool = False) -> None:
     """Run the autonomous management loop (5-min interval).
 
     Delegates to AutoManager.run_auto_loop() which has full per-step
     error handling, rate-limit awareness, and clean shutdown.
     """
-    manager = AutoManager(gh)
+    from auto_manager import DryRunGitHubProxy
 
-    print(f"[{_now_ts()}] Starting autonomous management loop...")
-    print(f"[{_now_ts()}] Repo: {gh.repo}")
-    print(f"[{_now_ts()}] Interval: {AUTO_LOOP_INTERVAL_SECONDS}s")
-    print()
+    setup_file_logging()
+    acquire_pid_lock()
+    signal.signal(signal.SIGTERM, _handle_sigterm)
 
-    manager.run_auto_loop(interval=AUTO_LOOP_INTERVAL_SECONDS)
+    try:
+        if dry_run:
+            gh = DryRunGitHubProxy(gh)
+            print(f"[{_now_ts()}] DRY-RUN MODE — no write operations")
+
+        manager = AutoManager(gh)
+
+        print(f"[{_now_ts()}] Starting autonomous management loop...")
+        print(f"[{_now_ts()}] Repo: {gh.repo}")
+        print(f"[{_now_ts()}] Interval: {AUTO_LOOP_INTERVAL_SECONDS}s")
+        print(f"[{_now_ts()}] PID: {os.getpid()}")
+        print(f"[{_now_ts()}] Log: {LOG_FILE}")
+        print()
+
+        max_cycles = 1 if dry_run else 0
+        manager.run_auto_loop(interval=AUTO_LOOP_INTERVAL_SECONDS, max_cycles=max_cycles)
+    finally:
+        release_pid_lock()
 
 
 def cmd_labels_setup(gh: GitHubConnector) -> None:
@@ -382,6 +402,56 @@ def _role_label_for_agent(agent: str) -> str | None:
     return mapping.get(agent)
 
 
+# ── Operational infrastructure ───────────────────────────────────────────────
+
+PID_FILE = Path.home() / ".claude" / "command-center" / "agent-mgr.pid"
+LOG_FILE = Path.home() / ".claude" / "command-center" / "agent-mgr.log"
+
+
+def setup_file_logging() -> None:
+    """Add a rotating file handler for auto mode."""
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    handler = RotatingFileHandler(
+        str(LOG_FILE), maxBytes=5 * 1024 * 1024, backupCount=3
+    )
+    handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
+    logging.getLogger().addHandler(handler)
+
+
+def acquire_pid_lock() -> None:
+    """Ensure only one auto-loop instance runs at a time."""
+    PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if PID_FILE.exists():
+        try:
+            old_pid = int(PID_FILE.read_text().strip())
+            os.kill(old_pid, 0)  # Check if process is alive
+            print(red(f"Error: Another agent-mgr auto-loop is running (PID {old_pid})."))
+            print(f"PID file: {PID_FILE}")
+            sys.exit(1)
+        except (ProcessLookupError, ValueError):
+            pass  # Stale PID file, overwrite it
+    PID_FILE.write_text(str(os.getpid()))
+
+
+def release_pid_lock() -> None:
+    """Remove the PID lock file."""
+    try:
+        if PID_FILE.exists():
+            PID_FILE.unlink()
+    except OSError:
+        pass
+
+
+def _handle_sigterm(signum: int, frame: Any) -> None:
+    """Convert SIGTERM to KeyboardInterrupt for graceful shutdown."""
+    raise KeyboardInterrupt
+
+
 # ── Argument parser ──────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
@@ -438,7 +508,11 @@ def build_parser() -> argparse.ArgumentParser:
     directive_parser.add_argument("message", help="Directive message text")
 
     # auto
-    subparsers.add_parser("auto", help="Run autonomous management loop (5-min interval)")
+    auto_parser = subparsers.add_parser("auto", help="Run autonomous management loop (5-min interval)")
+    auto_parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Run one cycle without making any write operations",
+    )
 
     # labels-setup
     subparsers.add_parser("labels-setup", help="Create standard labels in repo")
@@ -471,7 +545,7 @@ def main() -> None:
         "review": lambda: cmd_review(gh),
         "assign": lambda: cmd_assign(gh, args.agent, args.issue),
         "directive": lambda: cmd_directive(gh, args.agent, args.message),
-        "auto": lambda: cmd_auto(gh),
+        "auto": lambda: cmd_auto(gh, dry_run=getattr(args, "dry_run", False)),
         "labels-setup": lambda: cmd_labels_setup(gh),
     }
 

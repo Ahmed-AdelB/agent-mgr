@@ -58,6 +58,31 @@ _BG_YELLOW = "\033[43m"
 logger = logging.getLogger("auto_manager")
 
 
+# ---------------------------------------------------------------------------
+# DryRunGitHubProxy — intercepts write operations for safe testing
+# ---------------------------------------------------------------------------
+
+
+class DryRunGitHubProxy:
+    """Proxy that passes read operations through but noops write operations."""
+
+    _WRITE_METHODS: frozenset[str] = frozenset({
+        "add_comment", "add_labels", "remove_labels", "transition_status",
+        "create_issue", "close_issue", "reopen_issue", "post_comment",
+        "create_or_update_label",
+    })
+
+    def __init__(self, real_gh: GitHubConnector) -> None:
+        self._real = real_gh
+
+    def __getattr__(self, name: str) -> Any:
+        if name in self._WRITE_METHODS:
+            def _noop(*args: Any, **kwargs: Any) -> None:
+                logger.info("[DRY-RUN] Would call %s(%s, %s)", name, args, kwargs)
+            return _noop
+        return getattr(self._real, name)
+
+
 def _color(text: str, *codes: str) -> str:
     """Wrap *text* with ANSI escape codes."""
     return "".join(codes) + text + _RESET
@@ -968,10 +993,11 @@ class AutoManager:
     # 13. Run Auto Loop
     # ------------------------------------------------------------------
 
-    def run_auto_loop(self, interval: int = 300) -> None:
+    def run_auto_loop(self, interval: int = 300, max_cycles: int = 0) -> None:
         """Main autonomous management loop.
 
-        Runs indefinitely, executing all management tasks on each cycle:
+        Runs indefinitely (or for *max_cycles* cycles if > 0), executing
+        all management tasks on each cycle:
         1. Health check (log alerts for stale/dead agents)
         2. Process controller check (Hetzner connectivity and Kimi sessions)
         3. Sync GitHub tasks to INBOX.md files
@@ -988,13 +1014,23 @@ class AutoManager:
         sleep, ensuring a clean shutdown message in all cases.
         """
         cycle = 0
+        metrics = {
+            "total_cycles": 0,
+            "nudges_sent": 0,
+            "closes_prevented": 0,
+            "queues_replenished": 0,
+            "reviews_run": 0,
+        }
         logger.info(
-            "Starting auto-management loop (interval=%ds)", interval
+            "Starting auto-management loop (interval=%ds, max_cycles=%d)",
+            interval,
+            max_cycles,
         )
 
         while True:
             try:
                 cycle += 1
+                metrics["total_cycles"] = cycle
                 cycle_start = time.monotonic()
                 logger.info("--- Auto-loop cycle #%d ---", cycle)
 
@@ -1081,12 +1117,23 @@ class AutoManager:
 
                 elapsed = time.monotonic() - cycle_start
                 logger.info(
-                    "Cycle #%d completed in %.1fs. Sleeping %ds...",
+                    "Cycle #%d completed in %.1fs.",
                     cycle,
                     elapsed,
-                    interval,
                 )
 
+                # Log cumulative metrics every 10 cycles
+                if cycle % 10 == 0:
+                    logger.info(
+                        "METRICS after %d cycles: %s", cycle, metrics
+                    )
+
+                # Exit if max_cycles reached
+                if max_cycles > 0 and cycle >= max_cycles:
+                    logger.info("Reached max_cycles=%d. Exiting.", max_cycles)
+                    break
+
+                logger.info("Sleeping %ds...", interval)
                 try:
                     time.sleep(interval)
                 except KeyboardInterrupt:

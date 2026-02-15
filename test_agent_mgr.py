@@ -14,10 +14,13 @@ Author: Ahmed Adel Bakr Alderai
 from __future__ import annotations
 
 import json
+import logging
+import signal
 import subprocess
 import sys
 import os
 from datetime import datetime, timezone, timedelta
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch, call
 
@@ -2529,3 +2532,205 @@ class TestDirectiveLabelDeduplication:
         # Should contain role_label and status:ready
         assert "role:researcher" in labels_passed
         assert "status:ready" in labels_passed
+
+
+# ===========================================================================
+# TestDryRunProxy
+# ===========================================================================
+
+class TestDryRunProxy:
+    """Tests for DryRunGitHubProxy."""
+
+    def test_read_methods_pass_through(self):
+        from auto_manager import DryRunGitHubProxy
+        mock_gh = MagicMock(spec=GitHubConnector)
+        mock_gh.repo = "owner/repo"
+        mock_gh.list_issues.return_value = ["issue1"]
+        proxy = DryRunGitHubProxy(mock_gh)
+
+        result = proxy.list_issues(labels=["bug"])
+        assert result == ["issue1"]
+        mock_gh.list_issues.assert_called_once_with(labels=["bug"])
+
+    def test_write_methods_are_noops(self):
+        from auto_manager import DryRunGitHubProxy
+        mock_gh = MagicMock(spec=GitHubConnector)
+        mock_gh.repo = "owner/repo"
+        proxy = DryRunGitHubProxy(mock_gh)
+
+        # These should not call the real connector
+        proxy.add_comment(1, "test")
+        proxy.add_labels(1, ["bug"])
+        proxy.reopen_issue(1)
+        proxy.close_issue(1)
+        proxy.create_issue(title="t", body="b")
+        proxy.transition_status(1, "status:ready")
+
+        mock_gh.add_comment.assert_not_called()
+        mock_gh.add_labels.assert_not_called()
+        mock_gh.reopen_issue.assert_not_called()
+
+    def test_repo_attribute_passes_through(self):
+        from auto_manager import DryRunGitHubProxy
+        mock_gh = MagicMock(spec=GitHubConnector)
+        mock_gh.repo = "owner/repo"
+        proxy = DryRunGitHubProxy(mock_gh)
+
+        assert proxy.repo == "owner/repo"
+
+
+# ===========================================================================
+# TestMaxCycles
+# ===========================================================================
+
+class TestMaxCycles:
+    """Tests for max_cycles parameter in run_auto_loop."""
+
+    def _make_manager(self):
+        mock_gh = MagicMock(spec=GitHubConnector)
+        mock_gh.repo = "owner/repo"
+        from auto_manager import AutoManager
+        mgr = AutoManager(mock_gh)
+        return mgr, mock_gh
+
+    @patch("auto_manager.ProcessController")
+    @patch("auto_manager.time.sleep")
+    @patch("auto_manager._log_decision")
+    def test_max_cycles_exits_after_n_cycles(self, mock_log, mock_sleep, mock_pc_cls):
+        """Loop exits after max_cycles without needing KeyboardInterrupt."""
+        mgr, mock_gh = self._make_manager()
+        mock_gh.list_issues.return_value = []
+        mock_gh.get_comments.return_value = []
+        mock_gh.list_recently_closed.return_value = []
+
+        mock_pc = MagicMock()
+        mock_pc.check_hetzner_connectivity.return_value = True
+        mock_pc.count_kimi_sessions.return_value = 0
+        mock_pc_cls.return_value = mock_pc
+
+        mgr.run_auto_loop(interval=0, max_cycles=1)
+
+        # Sleep should NOT be called because max_cycles exits before sleep
+        mock_sleep.assert_not_called()
+
+    @patch("auto_manager.ProcessController")
+    @patch("auto_manager.time.sleep")
+    @patch("auto_manager._log_decision")
+    def test_max_cycles_zero_runs_indefinitely(self, mock_log, mock_sleep, mock_pc_cls):
+        """max_cycles=0 means infinite loop (needs KeyboardInterrupt to exit)."""
+        mgr, mock_gh = self._make_manager()
+        mock_gh.list_issues.return_value = []
+        mock_gh.get_comments.return_value = []
+        mock_gh.list_recently_closed.return_value = []
+
+        mock_pc = MagicMock()
+        mock_pc.check_hetzner_connectivity.return_value = True
+        mock_pc.count_kimi_sessions.return_value = 0
+        mock_pc_cls.return_value = mock_pc
+
+        mock_sleep.side_effect = KeyboardInterrupt()
+
+        mgr.run_auto_loop(interval=1, max_cycles=0)
+
+        # Sleep was called (loop attempted to continue)
+        mock_sleep.assert_called_once()
+
+
+# ===========================================================================
+# TestPidLock
+# ===========================================================================
+
+class TestPidLock:
+    """Tests for PID lock acquire/release."""
+
+    def test_acquire_and_release_pid_lock(self, tmp_path):
+        import agent_mgr
+        original_pid_file = agent_mgr.PID_FILE
+        agent_mgr.PID_FILE = tmp_path / "agent-mgr.pid"
+
+        try:
+            agent_mgr.acquire_pid_lock()
+            assert agent_mgr.PID_FILE.exists()
+            assert agent_mgr.PID_FILE.read_text().strip() == str(os.getpid())
+
+            agent_mgr.release_pid_lock()
+            assert not agent_mgr.PID_FILE.exists()
+        finally:
+            agent_mgr.PID_FILE = original_pid_file
+
+    def test_acquire_overwrites_stale_pid(self, tmp_path):
+        import agent_mgr
+        original_pid_file = agent_mgr.PID_FILE
+        agent_mgr.PID_FILE = tmp_path / "agent-mgr.pid"
+
+        try:
+            # Write a stale PID (very unlikely to be a running process)
+            agent_mgr.PID_FILE.write_text("999999999")
+
+            agent_mgr.acquire_pid_lock()
+            assert agent_mgr.PID_FILE.read_text().strip() == str(os.getpid())
+        finally:
+            agent_mgr.release_pid_lock()
+            agent_mgr.PID_FILE = original_pid_file
+
+
+# ===========================================================================
+# TestSignalHandler
+# ===========================================================================
+
+class TestSignalHandler:
+    """Tests for SIGTERM signal handler."""
+
+    def test_sigterm_handler_raises_keyboard_interrupt(self):
+        from agent_mgr import _handle_sigterm
+        with pytest.raises(KeyboardInterrupt):
+            _handle_sigterm(signal.SIGTERM, None)
+
+
+# ===========================================================================
+# TestFileLogging
+# ===========================================================================
+
+class TestFileLogging:
+    """Tests for file logging setup."""
+
+    def test_setup_file_logging_adds_handler(self, tmp_path):
+        import agent_mgr
+        original_log_file = agent_mgr.LOG_FILE
+        agent_mgr.LOG_FILE = tmp_path / "test.log"
+
+        try:
+            initial_handlers = len(logging.getLogger().handlers)
+            agent_mgr.setup_file_logging()
+            assert len(logging.getLogger().handlers) > initial_handlers
+
+            # Verify it's a RotatingFileHandler
+            new_handler = logging.getLogger().handlers[-1]
+            assert isinstance(new_handler, RotatingFileHandler)
+
+            # Clean up: remove the handler we added
+            logging.getLogger().removeHandler(new_handler)
+        finally:
+            agent_mgr.LOG_FILE = original_log_file
+
+
+# ===========================================================================
+# TestDryRunCLI
+# ===========================================================================
+
+class TestDryRunCLI:
+    """Tests for --dry-run CLI flag."""
+
+    def test_auto_dry_run_flag_parses(self):
+        from agent_mgr import build_parser
+        parser = build_parser()
+        args = parser.parse_args(["auto", "--dry-run"])
+        assert args.command == "auto"
+        assert args.dry_run is True
+
+    def test_auto_without_dry_run(self):
+        from agent_mgr import build_parser
+        parser = build_parser()
+        args = parser.parse_args(["auto"])
+        assert args.command == "auto"
+        assert args.dry_run is False

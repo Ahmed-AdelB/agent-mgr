@@ -20,6 +20,7 @@ from typing import Any
 
 from config import (
     AGENTS,
+    COMMAND_CENTER,
     PRIORITY_LABELS,
     REPO,
     STATUS_LABELS,
@@ -29,8 +30,10 @@ from config import (
     DEAD_HOURS,
     MIN_READY_TASKS,
     AUTO_LOOP_INTERVAL,
+    MANAGER_GITHUB_USER,
 )
 from github_connector import GitHubConnector
+from process_controller import ProcessController
 
 DECISIONS_PATH: Path = DECISIONS_FILE
 
@@ -770,7 +773,197 @@ class AutoManager:
                 )
 
     # ------------------------------------------------------------------
-    # 11. Run Auto Loop
+    # 11. Prevent Unauthorized Closes
+    # ------------------------------------------------------------------
+
+    def prevent_unauthorized_closes(self, hours: int = 24) -> None:
+        """Reopen issues that were closed by agents without manager approval.
+
+        Scans issues closed in the last *hours* hours that carry agent role
+        labels (role:builder, role:researcher, role:kimi).  For each such
+        issue, queries the GitHub events API to determine who closed it.
+        If the closer is not the manager, the issue is reopened with a
+        warning comment and the action is logged to DECISIONS.md.
+
+        Parameters
+        ----------
+        hours:
+            Look-back window in hours (default 24).
+        """
+        agent_role_labels = {
+            cfg["role_label"] for cfg in AGENTS.values()
+        }
+
+        try:
+            recently_closed = self.gh.list_recently_closed(hours=hours)
+        except Exception as exc:
+            logger.error("Failed to fetch recently closed issues: %s", exc)
+            return
+
+        for issue in recently_closed:
+            issue_labels = set(issue.get("labels", []))
+
+            # Only care about issues assigned to agents
+            matching_roles = issue_labels & agent_role_labels
+            if not matching_roles:
+                continue
+
+            issue_number = issue["number"]
+
+            # Determine who actually closed the issue via events API
+            try:
+                closer = self.gh.get_issue_closer(issue_number)
+            except Exception as exc:
+                logger.error(
+                    "Failed to determine closer for #%d: %s",
+                    issue_number,
+                    exc,
+                )
+                continue
+
+            # If closer cannot be determined, skip (fail-open)
+            if closer is None:
+                logger.warning(
+                    "Could not determine who closed #%d; skipping.",
+                    issue_number,
+                )
+                continue
+
+            # If the manager closed it, that is authorized
+            if closer == MANAGER_GITHUB_USER:
+                continue
+
+            # Unauthorized close -- reopen and warn
+            try:
+                self.gh.reopen_issue(issue_number)
+                self.gh.add_comment(
+                    issue_number,
+                    "Issues can only be closed by the Manager. "
+                    "Reopened automatically.",
+                )
+                _log_decision(
+                    "Unauthorized Close Prevention",
+                    f"Reopened #{issue_number} (closed by {closer})",
+                    f"Only {MANAGER_GITHUB_USER} may close agent issues. "
+                    f"Roles: {', '.join(matching_roles)}",
+                )
+                logger.warning(
+                    "Reopened #%d -- unauthorized close by %s",
+                    issue_number,
+                    closer,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Failed to reopen #%d after unauthorized close: %s",
+                    issue_number,
+                    exc,
+                )
+
+    # ------------------------------------------------------------------
+    # 12. Sync GitHub to INBOX
+    # ------------------------------------------------------------------
+
+    def sync_github_to_inbox(self) -> None:
+        """Sync top GitHub tasks to each agent's INBOX.md.
+
+        For each agent, gets their ``status:ready`` and ``status:in-progress``
+        issues from GitHub, then writes/updates the agent's INBOX.md file at
+        ``~/.claude/command-center/{agent}/INBOX.md``.
+
+        This bridges the GitHub-based agent-mgr with the file-based
+        command center that agents actually read.
+        """
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+        for agent_name, cfg in AGENTS.items():
+            try:
+                in_progress = self._get_agent_issues(
+                    agent_name, status="status:in-progress"
+                )
+                ready_issues = self._get_agent_issues(
+                    agent_name, status="status:ready"
+                )
+
+                # Build INBOX.md content
+                lines: list[str] = []
+                lines.append(f"# {agent_name.capitalize()} -- Task Inbox")
+                lines.append(f"**Updated:** {now_str}")
+                lines.append("")
+                lines.append("---")
+                lines.append("")
+
+                # Current assignment section
+                if in_progress:
+                    lines.append("## CURRENT ASSIGNMENT")
+                    lines.append("")
+                    lines.append("| # | Task | GitHub Issue | Status |")
+                    lines.append("|---|------|-------------|--------|")
+                    for issue in in_progress:
+                        number = issue["number"]
+                        title = issue["title"][:60]
+                        lines.append(
+                            f"| {number} | {title} | #{number} | in-progress |"
+                        )
+                    lines.append("")
+
+                # Ready queue section
+                if ready_issues:
+                    lines.append("## READY QUEUE")
+                    lines.append("")
+                    lines.append("| # | Task | GitHub Issue | Priority |")
+                    lines.append("|---|------|-------------|----------|")
+                    for issue in ready_issues:
+                        number = issue["number"]
+                        title = issue["title"][:60]
+                        labels = [
+                            lbl["name"] if isinstance(lbl, dict) else lbl
+                            for lbl in issue.get("labels", [])
+                        ]
+                        priority = _priority_label(labels)
+                        lines.append(
+                            f"| {number} | {title} | #{number} | {priority} |"
+                        )
+                    lines.append("")
+
+                if not in_progress and not ready_issues:
+                    lines.append("## NO TASKS")
+                    lines.append("")
+                    lines.append("No tasks currently assigned. Awaiting new assignments.")
+                    lines.append("")
+
+                # GitHub-first protocol section
+                lines.append("---")
+                lines.append("")
+                lines.append("## GITHUB-FIRST PROTOCOL")
+                lines.append("")
+                lines.append(
+                    f"1. Check issues: `gh issue list --repo {REPO} "
+                    f"--label {cfg['label']} --state open`"
+                )
+                lines.append("2. Comment on issue when starting")
+                lines.append("3. Reference issue # in commits")
+                lines.append("4. Comment with results when done")
+                lines.append("")
+
+                # Write the INBOX.md file
+                inbox_path = COMMAND_CENTER / agent_name / "INBOX.md"
+                inbox_path.parent.mkdir(parents=True, exist_ok=True)
+                inbox_path.write_text("\n".join(lines), encoding="utf-8")
+
+                logger.info(
+                    "Synced INBOX.md for %s (%d in-progress, %d ready)",
+                    agent_name,
+                    len(in_progress),
+                    len(ready_issues),
+                )
+
+            except Exception as exc:
+                logger.error(
+                    "Failed to sync INBOX.md for %s: %s", agent_name, exc
+                )
+
+    # ------------------------------------------------------------------
+    # 13. Run Auto Loop
     # ------------------------------------------------------------------
 
     def run_auto_loop(self, interval: int = 300) -> None:
@@ -778,10 +971,13 @@ class AutoManager:
 
         Runs indefinitely, executing all management tasks on each cycle:
         1. Health check (log alerts for stale/dead agents)
-        2. Replenish queues
-        3. Check dependencies
-        4. Nudge stale issues
-        5. Auto-review all needs-review items
+        2. Process controller check (Hetzner connectivity and Kimi sessions)
+        3. Sync GitHub tasks to INBOX.md files
+        4. Prevent unauthorized closes
+        5. Replenish queues
+        6. Check dependencies
+        7. Nudge stale issues
+        8. Auto-review all needs-review items
 
         Sleeps *interval* seconds between cycles.  Handles rate-limit and
         network errors gracefully by logging and continuing.
@@ -810,25 +1006,59 @@ class AutoManager:
             except Exception as exc:
                 logger.error("Health check cycle error: %s", exc)
 
-            # 2. Replenish queues
+            # 2. Process controller check
+            try:
+                pc = ProcessController()
+                reachable = pc.check_hetzner_connectivity()
+                if not reachable:
+                    logger.warning(
+                        "ALERT: Hetzner server is unreachable"
+                    )
+                else:
+                    kimi_count = pc.count_kimi_sessions()
+                    if kimi_count == 0:
+                        logger.warning(
+                            "ALERT: No active Kimi sessions on Hetzner"
+                        )
+                    else:
+                        logger.info(
+                            "Hetzner OK: %d active Kimi session(s)",
+                            kimi_count,
+                        )
+            except Exception as exc:
+                logger.error("Process controller cycle error: %s", exc)
+
+            # 3. Sync GitHub to INBOX.md
+            try:
+                self.sync_github_to_inbox()
+            except Exception as exc:
+                logger.error("INBOX sync cycle error: %s", exc)
+
+            # 4. Prevent unauthorized closes
+            try:
+                self.prevent_unauthorized_closes()
+            except Exception as exc:
+                logger.error("Close prevention cycle error: %s", exc)
+
+            # 5. Replenish queues
             try:
                 self.replenish_queues()
             except Exception as exc:
                 logger.error("Replenish cycle error: %s", exc)
 
-            # 3. Check dependencies
+            # 6. Check dependencies
             try:
                 self.check_dependencies()
             except Exception as exc:
                 logger.error("Dependency check cycle error: %s", exc)
 
-            # 4. Nudge stale
+            # 7. Nudge stale
             try:
                 self.nudge_stale()
             except Exception as exc:
                 logger.error("Nudge cycle error: %s", exc)
 
-            # 5. Auto-review needs-review items
+            # 8. Auto-review needs-review items
             try:
                 review_items = self.review_queue()
                 for item in review_items:

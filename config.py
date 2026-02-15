@@ -13,6 +13,9 @@ from pathlib import Path
 # GitHub repository
 REPO = "Ahmed-AdelB/ummro"
 
+# Manager GitHub username (only this user may close agent issues)
+MANAGER_GITHUB_USER = "Ahmed-AdelB"
+
 # Agent definitions
 AGENTS: dict[str, dict] = {
     "researcher": {

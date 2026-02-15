@@ -17,7 +17,7 @@ import logging
 import shlex
 import subprocess
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -585,6 +585,107 @@ class GitHubConnector:
             "--", full_query,
         ])
         return [Issue.from_dict(item) for item in data]
+
+    # ------------------------------------------------------------------
+    # Recently closed issues & close detection
+    # ------------------------------------------------------------------
+
+    def list_recently_closed(
+        self,
+        *,
+        hours: int = 24,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """List issues closed within the last *hours* hours.
+
+        Fetches closed issues and filters by ``closedAt`` timestamp.
+
+        Parameters
+        ----------
+        hours:
+            Look-back window in hours (default 24).
+        limit:
+            Maximum number of closed issues to fetch from the API.
+
+        Returns
+        -------
+        list[dict[str, Any]]
+            Recently closed issue dicts with keys: ``number``, ``title``,
+            ``labels`` (list[str]), ``closedAt`` (ISO string).
+        """
+        data = self._run_json([
+            "issue", "list",
+            "--repo", self.repo,
+            "--state", "closed",
+            "--json", "number,title,labels,closedAt",
+            "--limit", str(limit),
+        ])
+
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+        result: list[dict[str, Any]] = []
+
+        for item in data:
+            closed_at = item.get("closedAt", "")
+            if not closed_at:
+                continue
+
+            try:
+                closed_dt = datetime.fromisoformat(
+                    closed_at.replace("Z", "+00:00")
+                )
+            except (ValueError, TypeError):
+                logger.warning("Unparseable closedAt timestamp: %r", closed_at)
+                continue
+
+            if closed_dt >= cutoff:
+                labels_raw = item.get("labels") or []
+                if labels_raw and isinstance(labels_raw[0], dict):
+                    labels = [lb.get("name", "") for lb in labels_raw]
+                else:
+                    labels = [str(lb) for lb in labels_raw]
+
+                result.append({
+                    "number": int(item.get("number", 0)),
+                    "title": item.get("title", ""),
+                    "labels": labels,
+                    "closedAt": closed_at,
+                })
+
+        return result
+
+    def get_issue_closer(self, number: int) -> str | None:
+        """Return the GitHub username of the user who most recently closed
+        issue *number*.
+
+        Queries the issue timeline events API and extracts the actor login
+        from the last ``closed`` event.
+
+        Parameters
+        ----------
+        number:
+            Issue number.
+
+        Returns
+        -------
+        str | None
+            The login of the closer, or ``None`` if it cannot be determined.
+        """
+        try:
+            raw = self._run([
+                "api",
+                f"repos/{self.repo}/issues/{number}/events",
+                "--jq",
+                '[.[] | select(.event == "closed")] | last | .actor.login',
+            ])
+            login = raw.strip().strip('"')
+            if login and login != "null":
+                return login
+            return None
+        except CLIExecutionError:
+            logger.warning(
+                "Could not determine closer for issue #%d", number
+            )
+            return None
 
     # ------------------------------------------------------------------
     # Health / monitoring helpers

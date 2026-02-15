@@ -5,6 +5,9 @@ Covers:
 - TestGitHubConnector: subprocess.run mocking, error handling, security
 - TestAutoManager: GitHubConnector mocking, decision logic
 - TestCLI: argparse validation
+- TestProcessController: SSH process management with mocked subprocess
+- TestSyncGitHubToInbox: INBOX.md generation
+- TestAutoLoopWithProcessController: Integration of ProcessController in auto loop
 
 Author: Ahmed Adel Bakr Alderai
 """
@@ -85,6 +88,20 @@ def _issue_json(
         "updatedAt": "2025-01-01T01:00:00Z",
         "comments": {"totalCount": 0},
     }
+
+
+def _ssh_ok(stdout: str = "") -> subprocess.CompletedProcess:
+    """Build a successful SSH CompletedProcess."""
+    return subprocess.CompletedProcess(
+        args=["ssh", "hetzner"], stdout=stdout, stderr="", returncode=0
+    )
+
+
+def _ssh_fail(stderr: str = "error", rc: int = 1) -> subprocess.CompletedProcess:
+    """Build a failed SSH CompletedProcess."""
+    return subprocess.CompletedProcess(
+        args=["ssh", "hetzner"], stdout="", stderr=stderr, returncode=rc
+    )
 
 
 # ===========================================================================
@@ -1011,13 +1028,21 @@ class TestAutoManager:
     # run_auto_loop
     # ------------------------------------------------------------------
 
+    @patch("auto_manager.ProcessController")
     @patch("auto_manager.time.sleep")
     @patch("auto_manager._log_decision")
-    def test_run_auto_loop_cycles_through_all_checks(self, mock_log, mock_sleep):
+    def test_run_auto_loop_cycles_through_all_checks(self, mock_log, mock_sleep, mock_pc_cls):
         mgr, mock_gh = self._make_manager()
 
         mock_gh.list_issues.return_value = []
         mock_gh.get_comments.return_value = []
+        mock_gh.list_recently_closed.return_value = []
+
+        # Mock ProcessController
+        mock_pc = MagicMock()
+        mock_pc.check_hetzner_connectivity.return_value = True
+        mock_pc.count_kimi_sessions.return_value = 1
+        mock_pc_cls.return_value = mock_pc
 
         # Make sleep raise KeyboardInterrupt to exit the loop after one cycle
         mock_sleep.side_effect = KeyboardInterrupt()
@@ -1026,6 +1051,8 @@ class TestAutoManager:
 
         # Verify that list_issues was called (health_check, replenish, dependencies, nudge all use it)
         assert mock_gh.list_issues.call_count > 0
+        # Verify prevent_unauthorized_closes was called
+        mock_gh.list_recently_closed.assert_called_once()
 
 
 # ===========================================================================
@@ -1220,3 +1247,1137 @@ class TestHelperFunctions:
         from auto_manager import _priority_label
         assert _priority_label(["P1", "bug"]) == "P1"
         assert _priority_label(["no-prio"]) == "P?"
+
+
+# ===========================================================================
+# TestListRecentlyClosed
+# ===========================================================================
+
+class TestListRecentlyClosed:
+    """Tests for GitHubConnector.list_recently_closed()."""
+
+    @patch("github_connector.subprocess.run")
+    def test_list_recently_closed_filters_by_time(self, mock_run):
+        """Only returns issues closed within the specified hours window."""
+        gh = _build_connector(mock_run)
+        now = datetime.now(timezone.utc)
+
+        # Issue closed 1 hour ago (should be included)
+        recent_closed = (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # Issue closed 48 hours ago (should be excluded)
+        old_closed = (now - timedelta(hours=48)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        issues_data = [
+            {
+                "number": 1,
+                "title": "Recent issue",
+                "labels": [{"name": "role:builder"}],
+                "closedAt": recent_closed,
+            },
+            {
+                "number": 2,
+                "title": "Old issue",
+                "labels": [{"name": "role:researcher"}],
+                "closedAt": old_closed,
+            },
+        ]
+        mock_run.return_value = _gh_ok(json.dumps(issues_data))
+
+        result = gh.list_recently_closed(hours=24)
+
+        assert len(result) == 1
+        assert result[0]["number"] == 1
+        assert result[0]["title"] == "Recent issue"
+        assert result[0]["labels"] == ["role:builder"]
+
+    @patch("github_connector.subprocess.run")
+    def test_list_recently_closed_handles_string_labels(self, mock_run):
+        """Handles both dict-style and string-style labels."""
+        gh = _build_connector(mock_run)
+        now = datetime.now(timezone.utc)
+        closed_at = (now - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        issues_data = [
+            {
+                "number": 5,
+                "title": "String labels",
+                "labels": ["role:kimi", "P0"],
+                "closedAt": closed_at,
+            },
+        ]
+        mock_run.return_value = _gh_ok(json.dumps(issues_data))
+
+        result = gh.list_recently_closed(hours=24)
+
+        assert len(result) == 1
+        assert result[0]["labels"] == ["role:kimi", "P0"]
+
+    @patch("github_connector.subprocess.run")
+    def test_list_recently_closed_skips_invalid_timestamps(self, mock_run):
+        """Skips issues with unparseable closedAt timestamps."""
+        gh = _build_connector(mock_run)
+
+        issues_data = [
+            {
+                "number": 1,
+                "title": "Bad timestamp",
+                "labels": [{"name": "role:builder"}],
+                "closedAt": "not-a-valid-date",
+            },
+            {
+                "number": 2,
+                "title": "Missing timestamp",
+                "labels": [{"name": "role:builder"}],
+                "closedAt": "",
+            },
+        ]
+        mock_run.return_value = _gh_ok(json.dumps(issues_data))
+
+        result = gh.list_recently_closed(hours=24)
+
+        assert len(result) == 0
+
+    @patch("github_connector.subprocess.run")
+    def test_list_recently_closed_empty_response(self, mock_run):
+        """Returns empty list when no closed issues found."""
+        gh = _build_connector(mock_run)
+        mock_run.return_value = _gh_ok(json.dumps([]))
+
+        result = gh.list_recently_closed(hours=24)
+
+        assert result == []
+
+    @patch("github_connector.subprocess.run")
+    def test_list_recently_closed_uses_correct_gh_args(self, mock_run):
+        """Verify the correct gh command arguments are used."""
+        gh = _build_connector(mock_run)
+        mock_run.return_value = _gh_ok(json.dumps([]))
+
+        gh.list_recently_closed(hours=24, limit=50)
+
+        args_passed = mock_run.call_args[0][0]
+        args_str = " ".join(str(a) for a in args_passed)
+        assert "issue" in args_str
+        assert "list" in args_str
+        assert "--state" in args_str
+        assert "closed" in args_str
+        assert "closedAt" in args_str
+
+
+# ===========================================================================
+# TestGetIssueCloser
+# ===========================================================================
+
+class TestGetIssueCloser:
+    """Tests for GitHubConnector.get_issue_closer()."""
+
+    @patch("github_connector.subprocess.run")
+    def test_get_issue_closer_returns_login(self, mock_run):
+        """Returns the login of the user who closed the issue."""
+        gh = _build_connector(mock_run)
+        mock_run.return_value = _gh_ok("agentuser\n")
+
+        result = gh.get_issue_closer(42)
+
+        assert result == "agentuser"
+        # Verify API call uses correct path
+        args_passed = mock_run.call_args[0][0]
+        args_str = " ".join(str(a) for a in args_passed)
+        assert "api" in args_str
+        assert "issues/42/events" in args_str
+
+    @patch("github_connector.subprocess.run")
+    def test_get_issue_closer_returns_none_for_null(self, mock_run):
+        """Returns None when jq output is null (no close events)."""
+        gh = _build_connector(mock_run)
+        mock_run.return_value = _gh_ok("null\n")
+
+        result = gh.get_issue_closer(42)
+
+        assert result is None
+
+    @patch("github_connector.subprocess.run")
+    def test_get_issue_closer_returns_none_on_error(self, mock_run):
+        """Returns None when the API call fails."""
+        gh = _build_connector(mock_run)
+        mock_run.return_value = _gh_fail("API error", rc=1)
+
+        result = gh.get_issue_closer(42)
+
+        assert result is None
+
+    @patch("github_connector.subprocess.run")
+    def test_get_issue_closer_strips_quotes(self, mock_run):
+        """Strips surrounding quotes from the login."""
+        gh = _build_connector(mock_run)
+        mock_run.return_value = _gh_ok('"quoteduser"\n')
+
+        result = gh.get_issue_closer(42)
+
+        assert result == "quoteduser"
+
+    @patch("github_connector.subprocess.run")
+    def test_get_issue_closer_returns_none_for_empty(self, mock_run):
+        """Returns None when the output is empty."""
+        gh = _build_connector(mock_run)
+        mock_run.return_value = _gh_ok("\n")
+
+        result = gh.get_issue_closer(42)
+
+        assert result is None
+
+
+# ===========================================================================
+# TestPreventUnauthorizedCloses
+# ===========================================================================
+
+class TestPreventUnauthorizedCloses:
+    """Tests for AutoManager.prevent_unauthorized_closes()."""
+
+    def _make_manager(self):
+        """Return (AutoManager, mock_gh)."""
+        mock_gh = MagicMock(spec=GitHubConnector)
+        mock_gh.repo = "owner/repo"
+        from auto_manager import AutoManager
+        mgr = AutoManager(mock_gh)
+        return mgr, mock_gh
+
+    @patch("auto_manager._log_decision")
+    @patch("auto_manager.MANAGER_GITHUB_USER", "Ahmed-AdelB")
+    def test_reopens_issue_closed_by_non_manager(self, mock_log):
+        """Reopens issues closed by agents (not manager)."""
+        mgr, mock_gh = self._make_manager()
+        now = datetime.now(timezone.utc)
+        closed_at = (now - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        mock_gh.list_recently_closed.return_value = [
+            {
+                "number": 42,
+                "title": "Agent closed this",
+                "labels": ["role:builder", "status:in-progress"],
+                "closedAt": closed_at,
+            },
+        ]
+        mock_gh.get_issue_closer.return_value = "agentuser"
+
+        mgr.prevent_unauthorized_closes(hours=24)
+
+        mock_gh.reopen_issue.assert_called_once_with(42)
+        mock_gh.add_comment.assert_called_once()
+        comment_body = mock_gh.add_comment.call_args[0][1]
+        assert "Issues can only be closed by the Manager" in comment_body
+        assert "Reopened automatically" in comment_body
+
+    @patch("auto_manager._log_decision")
+    @patch("auto_manager.MANAGER_GITHUB_USER", "Ahmed-AdelB")
+    def test_skips_issue_closed_by_manager(self, mock_log):
+        """Does not reopen issues closed by the manager."""
+        mgr, mock_gh = self._make_manager()
+        now = datetime.now(timezone.utc)
+        closed_at = (now - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        mock_gh.list_recently_closed.return_value = [
+            {
+                "number": 50,
+                "title": "Manager closed this",
+                "labels": ["role:researcher"],
+                "closedAt": closed_at,
+            },
+        ]
+        mock_gh.get_issue_closer.return_value = "Ahmed-AdelB"
+
+        mgr.prevent_unauthorized_closes(hours=24)
+
+        mock_gh.reopen_issue.assert_not_called()
+        mock_gh.add_comment.assert_not_called()
+
+    @patch("auto_manager._log_decision")
+    @patch("auto_manager.MANAGER_GITHUB_USER", "Ahmed-AdelB")
+    def test_skips_issues_without_role_labels(self, mock_log):
+        """Does not touch issues without agent role labels."""
+        mgr, mock_gh = self._make_manager()
+        now = datetime.now(timezone.utc)
+        closed_at = (now - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        mock_gh.list_recently_closed.return_value = [
+            {
+                "number": 60,
+                "title": "Regular bug",
+                "labels": ["bug", "P0"],
+                "closedAt": closed_at,
+            },
+        ]
+
+        mgr.prevent_unauthorized_closes(hours=24)
+
+        mock_gh.reopen_issue.assert_not_called()
+        mock_gh.add_comment.assert_not_called()
+        # Should not even call get_issue_closer for non-agent issues
+        mock_gh.get_issue_closer.assert_not_called()
+
+    @patch("auto_manager._log_decision")
+    @patch("auto_manager.MANAGER_GITHUB_USER", "Ahmed-AdelB")
+    def test_handles_all_role_labels(self, mock_log):
+        """Works with all three agent role labels."""
+        mgr, mock_gh = self._make_manager()
+        now = datetime.now(timezone.utc)
+        closed_at = (now - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        mock_gh.list_recently_closed.return_value = [
+            {
+                "number": 71,
+                "title": "Researcher issue",
+                "labels": ["role:researcher"],
+                "closedAt": closed_at,
+            },
+            {
+                "number": 72,
+                "title": "Builder issue",
+                "labels": ["role:builder"],
+                "closedAt": closed_at,
+            },
+            {
+                "number": 73,
+                "title": "Kimi issue",
+                "labels": ["role:kimi"],
+                "closedAt": closed_at,
+            },
+        ]
+        mock_gh.get_issue_closer.return_value = "some-agent"
+
+        mgr.prevent_unauthorized_closes(hours=24)
+
+        assert mock_gh.reopen_issue.call_count == 3
+        assert mock_gh.add_comment.call_count == 3
+
+    @patch("auto_manager._log_decision")
+    @patch("auto_manager.MANAGER_GITHUB_USER", "Ahmed-AdelB")
+    def test_logs_decision_on_unauthorized_close(self, mock_log):
+        """Logs decision when reopening unauthorized closes."""
+        mgr, mock_gh = self._make_manager()
+        now = datetime.now(timezone.utc)
+        closed_at = (now - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        mock_gh.list_recently_closed.return_value = [
+            {
+                "number": 80,
+                "title": "Unauthorized close",
+                "labels": ["role:builder"],
+                "closedAt": closed_at,
+            },
+        ]
+        mock_gh.get_issue_closer.return_value = "badactor"
+
+        mgr.prevent_unauthorized_closes(hours=24)
+
+        mock_log.assert_called_once()
+        call_args = mock_log.call_args
+        assert call_args[0][0] == "Unauthorized Close Prevention"
+        assert "#80" in call_args[0][1]
+        assert "badactor" in call_args[0][1]
+
+    @patch("auto_manager._log_decision")
+    @patch("auto_manager.MANAGER_GITHUB_USER", "Ahmed-AdelB")
+    def test_handles_list_recently_closed_failure(self, mock_log):
+        """Gracefully handles failures from list_recently_closed."""
+        mgr, mock_gh = self._make_manager()
+        mock_gh.list_recently_closed.side_effect = Exception("API error")
+
+        # Should not raise
+        mgr.prevent_unauthorized_closes(hours=24)
+
+        mock_gh.reopen_issue.assert_not_called()
+
+    @patch("auto_manager._log_decision")
+    @patch("auto_manager.MANAGER_GITHUB_USER", "Ahmed-AdelB")
+    def test_handles_reopen_failure(self, mock_log):
+        """Continues processing if one reopen fails."""
+        mgr, mock_gh = self._make_manager()
+        now = datetime.now(timezone.utc)
+        closed_at = (now - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        mock_gh.list_recently_closed.return_value = [
+            {
+                "number": 90,
+                "title": "First issue",
+                "labels": ["role:builder"],
+                "closedAt": closed_at,
+            },
+            {
+                "number": 91,
+                "title": "Second issue",
+                "labels": ["role:builder"],
+                "closedAt": closed_at,
+            },
+        ]
+        mock_gh.get_issue_closer.return_value = "agent1"
+        mock_gh.reopen_issue.side_effect = [Exception("Cannot reopen"), None]
+
+        # Should not raise
+        mgr.prevent_unauthorized_closes(hours=24)
+
+        # Both issues should be attempted
+        assert mock_gh.reopen_issue.call_count == 2
+
+    @patch("auto_manager._log_decision")
+    @patch("auto_manager.MANAGER_GITHUB_USER", "Ahmed-AdelB")
+    def test_skips_when_closer_unknown(self, mock_log):
+        """Skips issues when the closer cannot be determined (fail-open)."""
+        mgr, mock_gh = self._make_manager()
+        now = datetime.now(timezone.utc)
+        closed_at = (now - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        mock_gh.list_recently_closed.return_value = [
+            {
+                "number": 95,
+                "title": "Unknown closer",
+                "labels": ["role:builder"],
+                "closedAt": closed_at,
+            },
+        ]
+        mock_gh.get_issue_closer.return_value = None
+
+        mgr.prevent_unauthorized_closes(hours=24)
+
+        mock_gh.reopen_issue.assert_not_called()
+
+    @patch("auto_manager._log_decision")
+    @patch("auto_manager.MANAGER_GITHUB_USER", "Ahmed-AdelB")
+    def test_handles_get_issue_closer_exception(self, mock_log):
+        """Continues if get_issue_closer raises an exception."""
+        mgr, mock_gh = self._make_manager()
+        now = datetime.now(timezone.utc)
+        closed_at = (now - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        mock_gh.list_recently_closed.return_value = [
+            {
+                "number": 96,
+                "title": "Closer API fails",
+                "labels": ["role:researcher"],
+                "closedAt": closed_at,
+            },
+            {
+                "number": 97,
+                "title": "This one works",
+                "labels": ["role:builder"],
+                "closedAt": closed_at,
+            },
+        ]
+        mock_gh.get_issue_closer.side_effect = [Exception("API error"), "agent-bot"]
+
+        mgr.prevent_unauthorized_closes(hours=24)
+
+        # Only the second issue should be reopened
+        mock_gh.reopen_issue.assert_called_once_with(97)
+
+    @patch("auto_manager._log_decision")
+    @patch("auto_manager.MANAGER_GITHUB_USER", "Ahmed-AdelB")
+    def test_no_recently_closed_issues(self, mock_log):
+        """No-op when there are no recently closed issues."""
+        mgr, mock_gh = self._make_manager()
+        mock_gh.list_recently_closed.return_value = []
+
+        mgr.prevent_unauthorized_closes(hours=24)
+
+        mock_gh.reopen_issue.assert_not_called()
+        mock_gh.add_comment.assert_not_called()
+        mock_gh.get_issue_closer.assert_not_called()
+
+
+# ===========================================================================
+# TestRunAutoLoopIntegration
+# ===========================================================================
+
+class TestRunAutoLoopIntegration:
+    """Tests for run_auto_loop calling prevent_unauthorized_closes."""
+
+    def _make_manager(self):
+        """Return (AutoManager, mock_gh)."""
+        mock_gh = MagicMock(spec=GitHubConnector)
+        mock_gh.repo = "owner/repo"
+        from auto_manager import AutoManager
+        mgr = AutoManager(mock_gh)
+        return mgr, mock_gh
+
+    @patch("auto_manager.ProcessController")
+    @patch("auto_manager.time.sleep")
+    @patch("auto_manager._log_decision")
+    def test_run_auto_loop_calls_prevent_unauthorized_closes(self, mock_log, mock_sleep, mock_pc_cls):
+        """Verify prevent_unauthorized_closes is called during auto loop."""
+        mgr, mock_gh = self._make_manager()
+
+        mock_gh.list_issues.return_value = []
+        mock_gh.get_comments.return_value = []
+        mock_gh.list_recently_closed.return_value = []
+
+        # Mock ProcessController
+        mock_pc = MagicMock()
+        mock_pc.check_hetzner_connectivity.return_value = True
+        mock_pc.count_kimi_sessions.return_value = 1
+        mock_pc_cls.return_value = mock_pc
+
+        # Make sleep raise KeyboardInterrupt to exit the loop after one cycle
+        mock_sleep.side_effect = KeyboardInterrupt()
+
+        mgr.run_auto_loop(interval=1)
+
+        # Verify prevent_unauthorized_closes was called via list_recently_closed
+        mock_gh.list_recently_closed.assert_called_once()
+
+
+# ===========================================================================
+# TestProcessController
+# ===========================================================================
+
+class TestProcessController:
+    """Tests for ProcessController with subprocess.run mocked."""
+
+    def _make_controller(self):
+        from process_controller import ProcessController
+        return ProcessController(hetzner_host="hetzner", timeout=10)
+
+    # ------------------------------------------------------------------
+    # Initialization
+    # ------------------------------------------------------------------
+
+    def test_init_defaults(self):
+        from process_controller import ProcessController
+        pc = ProcessController()
+        assert pc.hetzner_host == "hetzner"
+        assert pc.timeout == 30
+
+    def test_init_custom_host(self):
+        from process_controller import ProcessController
+        pc = ProcessController(hetzner_host="myhost", timeout=60)
+        assert pc.hetzner_host == "myhost"
+        assert pc.timeout == 60
+
+    # ------------------------------------------------------------------
+    # check_hetzner_connectivity
+    # ------------------------------------------------------------------
+
+    @patch("process_controller.subprocess.run")
+    def test_check_hetzner_connectivity_success(self, mock_run):
+        """Returns True when SSH echo ok succeeds."""
+        pc = self._make_controller()
+        mock_run.return_value = _ssh_ok("ok\n")
+
+        result = pc.check_hetzner_connectivity()
+
+        assert result is True
+        args_passed = mock_run.call_args[0][0]
+        assert args_passed == ["ssh", "hetzner", "echo ok"]
+
+    @patch("process_controller.subprocess.run")
+    def test_check_hetzner_connectivity_failure_nonzero_rc(self, mock_run):
+        """Returns False when SSH returns non-zero."""
+        pc = self._make_controller()
+        mock_run.return_value = _ssh_fail("Connection refused", rc=255)
+
+        result = pc.check_hetzner_connectivity()
+
+        assert result is False
+
+    @patch("process_controller.subprocess.run")
+    def test_check_hetzner_connectivity_timeout(self, mock_run):
+        """Returns False when SSH times out."""
+        pc = self._make_controller()
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd="ssh", timeout=10)
+
+        result = pc.check_hetzner_connectivity()
+
+        assert result is False
+
+    @patch("process_controller.subprocess.run")
+    def test_check_hetzner_connectivity_ssh_not_found(self, mock_run):
+        """Returns False when ssh binary is not found."""
+        pc = self._make_controller()
+        mock_run.side_effect = FileNotFoundError("ssh not found")
+
+        result = pc.check_hetzner_connectivity()
+
+        assert result is False
+
+    @patch("process_controller.subprocess.run")
+    def test_check_hetzner_connectivity_os_error(self, mock_run):
+        """Returns False on generic OSError."""
+        pc = self._make_controller()
+        mock_run.side_effect = OSError("Network down")
+
+        result = pc.check_hetzner_connectivity()
+
+        assert result is False
+
+    @patch("process_controller.subprocess.run")
+    def test_check_hetzner_connectivity_unexpected_output(self, mock_run):
+        """Returns False when output does not contain 'ok'."""
+        pc = self._make_controller()
+        mock_run.return_value = _ssh_ok("unexpected output\n")
+
+        result = pc.check_hetzner_connectivity()
+
+        assert result is False
+
+    # ------------------------------------------------------------------
+    # check_kimi_processes
+    # ------------------------------------------------------------------
+
+    @patch("process_controller.subprocess.run")
+    def test_check_kimi_processes_found(self, mock_run):
+        """Returns parsed process list when kimi processes exist."""
+        pc = self._make_controller()
+        ps_output = (
+            "aadel  12345  0.5  1.2 123456 78901 ?  S  Jan01  10:30:00 kimi --yolo -m kimi-k2\n"
+            "aadel  12346  0.3  0.8 123456 78902 ?  S  Jan01  05:15:00 kimi --yolo -m kimi-k2\n"
+        )
+        mock_run.return_value = _ssh_ok(ps_output)
+
+        result = pc.check_kimi_processes()
+
+        assert len(result) == 2
+        assert result[0]["pid"] == 12345
+        assert "kimi" in result[0]["cmd"]
+        assert result[0]["uptime"] == "10:30:00"
+        assert result[1]["pid"] == 12346
+
+    @patch("process_controller.subprocess.run")
+    def test_check_kimi_processes_none_found(self, mock_run):
+        """Returns empty list when no kimi processes found (grep rc=1)."""
+        pc = self._make_controller()
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=["ssh", "hetzner"], stdout="", stderr="", returncode=1
+        )
+
+        result = pc.check_kimi_processes()
+
+        assert result == []
+
+    @patch("process_controller.subprocess.run")
+    def test_check_kimi_processes_ssh_failure(self, mock_run):
+        """Returns empty list on SSH failure."""
+        pc = self._make_controller()
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd="ssh", timeout=10)
+
+        result = pc.check_kimi_processes()
+
+        assert result == []
+
+    @patch("process_controller.subprocess.run")
+    def test_check_kimi_processes_error_with_stderr(self, mock_run):
+        """Returns empty list when SSH returns error with stderr."""
+        pc = self._make_controller()
+        mock_run.return_value = _ssh_fail("Permission denied", rc=255)
+
+        result = pc.check_kimi_processes()
+
+        assert result == []
+
+    # ------------------------------------------------------------------
+    # run_kimi_task
+    # ------------------------------------------------------------------
+
+    @patch("process_controller.subprocess.run")
+    def test_run_kimi_task_success(self, mock_run):
+        """Returns success dict when task completes."""
+        pc = self._make_controller()
+        mock_run.return_value = _ssh_ok("Task completed successfully\n")
+
+        result = pc.run_kimi_task("Write a test")
+
+        assert result["success"] is True
+        assert "Task completed" in result["stdout"]
+        assert result["stderr"] == ""
+
+    @patch("process_controller.subprocess.run")
+    def test_run_kimi_task_failure(self, mock_run):
+        """Returns failure dict when task fails."""
+        pc = self._make_controller()
+        mock_run.return_value = _ssh_fail("Error: model not found", rc=1)
+
+        result = pc.run_kimi_task("Write a test")
+
+        assert result["success"] is False
+        assert "model not found" in result["stderr"]
+
+    @patch("process_controller.subprocess.run")
+    def test_run_kimi_task_timeout(self, mock_run):
+        """Returns failure dict when SSH times out."""
+        pc = self._make_controller()
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd="ssh", timeout=120)
+
+        result = pc.run_kimi_task("Long task", timeout=120)
+
+        assert result["success"] is False
+        assert "failed or timed out" in result["stderr"]
+
+    @patch("process_controller.subprocess.run")
+    def test_run_kimi_task_uses_shlex_quote(self, mock_run):
+        """Verifies that prompt is safely quoted via shlex.quote."""
+        pc = self._make_controller()
+        mock_run.return_value = _ssh_ok("done\n")
+
+        pc.run_kimi_task("test's prompt with $(dangerous) chars")
+
+        args_passed = mock_run.call_args[0][0]
+        remote_cmd = args_passed[2]  # The remote command string
+        # shlex.quote wraps in single quotes, escaping existing ones
+        assert "$(dangerous)" not in remote_cmd or "'" in remote_cmd
+
+    @patch("process_controller.subprocess.run")
+    def test_run_kimi_task_custom_model_and_dir(self, mock_run):
+        """Passes custom model and working directory."""
+        pc = self._make_controller()
+        mock_run.return_value = _ssh_ok("done\n")
+
+        pc.run_kimi_task("prompt", model="kimi-k2.5", working_dir="/tmp/work")
+
+        args_passed = mock_run.call_args[0][0]
+        remote_cmd = args_passed[2]
+        assert "kimi-k2.5" in remote_cmd or "'kimi-k2.5'" in remote_cmd
+        assert "/tmp/work" in remote_cmd or "'/tmp/work'" in remote_cmd
+
+    # ------------------------------------------------------------------
+    # kill_stale_kimi
+    # ------------------------------------------------------------------
+
+    @patch("process_controller.subprocess.run")
+    def test_kill_stale_kimi_success(self, mock_run):
+        """Returns True when kill succeeds."""
+        pc = self._make_controller()
+        mock_run.return_value = _ssh_ok("")
+
+        result = pc.kill_stale_kimi(12345)
+
+        assert result is True
+        args_passed = mock_run.call_args[0][0]
+        assert args_passed == ["ssh", "hetzner", "kill 12345"]
+
+    @patch("process_controller.subprocess.run")
+    def test_kill_stale_kimi_failure(self, mock_run):
+        """Returns False when kill fails."""
+        pc = self._make_controller()
+        mock_run.return_value = _ssh_fail("No such process", rc=1)
+
+        result = pc.kill_stale_kimi(99999)
+
+        assert result is False
+
+    @patch("process_controller.subprocess.run")
+    def test_kill_stale_kimi_invalid_pid(self, mock_run):
+        """Returns False for invalid PID values."""
+        pc = self._make_controller()
+
+        assert pc.kill_stale_kimi(0) is False
+        assert pc.kill_stale_kimi(-1) is False
+        mock_run.assert_not_called()
+
+    @patch("process_controller.subprocess.run")
+    def test_kill_stale_kimi_ssh_timeout(self, mock_run):
+        """Returns False when SSH times out."""
+        pc = self._make_controller()
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd="ssh", timeout=10)
+
+        result = pc.kill_stale_kimi(12345)
+
+        assert result is False
+
+    # ------------------------------------------------------------------
+    # count_kimi_sessions
+    # ------------------------------------------------------------------
+
+    @patch("process_controller.subprocess.run")
+    def test_count_kimi_sessions_returns_count(self, mock_run):
+        """Returns correct count of running processes."""
+        pc = self._make_controller()
+        ps_output = (
+            "aadel  12345  0.5  1.2 123456 78901 ?  S  Jan01  10:30:00 kimi --yolo\n"
+            "aadel  12346  0.3  0.8 123456 78902 ?  S  Jan01  05:15:00 kimi --yolo\n"
+        )
+        mock_run.return_value = _ssh_ok(ps_output)
+
+        result = pc.count_kimi_sessions()
+
+        assert result == 2
+
+    @patch("process_controller.subprocess.run")
+    def test_count_kimi_sessions_zero_when_none(self, mock_run):
+        """Returns 0 when no kimi processes found."""
+        pc = self._make_controller()
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=["ssh", "hetzner"], stdout="", stderr="", returncode=1
+        )
+
+        result = pc.count_kimi_sessions()
+
+        assert result == 0
+
+    @patch("process_controller.subprocess.run")
+    def test_count_kimi_sessions_zero_on_failure(self, mock_run):
+        """Returns 0 on SSH failure."""
+        pc = self._make_controller()
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd="ssh", timeout=10)
+
+        result = pc.count_kimi_sessions()
+
+        assert result == 0
+
+    # ------------------------------------------------------------------
+    # check_hetzner_resources
+    # ------------------------------------------------------------------
+
+    @patch("process_controller.subprocess.run")
+    def test_check_hetzner_resources_parses_output(self, mock_run):
+        """Parses free and uptime output correctly."""
+        pc = self._make_controller()
+        combined_output = (
+            "              total        used        free      shared  buff/cache   available\n"
+            "Mem:             62          45          10           1           7          16\n"
+            "Swap:             0           0           0\n"
+            " 14:30:00 up 10 days,  5:30,  2 users,  load average: 2.50, 2.00, 1.50\n"
+        )
+        mock_run.return_value = _ssh_ok(combined_output)
+
+        result = pc.check_hetzner_resources()
+
+        assert result is not None
+        assert result["ram_total_gb"] == 62.0
+        assert result["ram_used_gb"] == 45.0
+        assert result["ram_pct"] > 0
+        assert result["load_avg"] == "2.50"
+        assert result["cpu_pct"] == 250.0
+
+    @patch("process_controller.subprocess.run")
+    def test_check_hetzner_resources_returns_none_on_failure(self, mock_run):
+        """Returns None when SSH fails."""
+        pc = self._make_controller()
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd="ssh", timeout=10)
+
+        result = pc.check_hetzner_resources()
+
+        assert result is None
+
+    @patch("process_controller.subprocess.run")
+    def test_check_hetzner_resources_returns_none_on_error_rc(self, mock_run):
+        """Returns None when SSH returns non-zero."""
+        pc = self._make_controller()
+        mock_run.return_value = _ssh_fail("Permission denied", rc=255)
+
+        result = pc.check_hetzner_resources()
+
+        assert result is None
+
+    @patch("process_controller.subprocess.run")
+    def test_check_hetzner_resources_handles_empty_output(self, mock_run):
+        """Handles gracefully when output has no parseable data."""
+        pc = self._make_controller()
+        mock_run.return_value = _ssh_ok("nothing useful here\n")
+
+        result = pc.check_hetzner_resources()
+
+        assert result is not None
+        assert result["ram_total_gb"] == 0.0
+        assert result["ram_used_gb"] == 0.0
+        assert result["load_avg"] == ""
+
+
+# ===========================================================================
+# TestSyncGitHubToInbox
+# ===========================================================================
+
+class TestSyncGitHubToInbox:
+    """Tests for AutoManager.sync_github_to_inbox()."""
+
+    def _make_manager(self):
+        """Return (AutoManager, mock_gh)."""
+        mock_gh = MagicMock(spec=GitHubConnector)
+        mock_gh.repo = "owner/repo"
+        from auto_manager import AutoManager
+        mgr = AutoManager(mock_gh)
+        return mgr, mock_gh
+
+    def _make_issue_obj(
+        self,
+        number: int = 1,
+        title: str = "Test",
+        body: str = "body",
+        labels: list[str] | None = None,
+    ) -> Issue:
+        return Issue(
+            number=number,
+            title=title,
+            state="OPEN",
+            body=body,
+            labels=labels or [],
+            url=f"https://github.com/owner/repo/issues/{number}",
+            created_at="2025-01-01T00:00:00Z",
+            updated_at="2025-01-01T01:00:00Z",
+        )
+
+    @patch("auto_manager.COMMAND_CENTER")
+    @patch("auto_manager._log_decision")
+    def test_sync_writes_inbox_with_in_progress_tasks(self, mock_log, mock_cc):
+        """Writes INBOX.md with current assignment when in-progress tasks exist."""
+        mgr, mock_gh = self._make_manager()
+
+        mock_gh.list_issues.return_value = [
+            self._make_issue_obj(42, "Build auth module", labels=["builder", "status:in-progress", "P0"]),
+        ]
+
+        # Use a temp path for COMMAND_CENTER
+        mock_inbox_path = MagicMock()
+        mock_inbox_parent = MagicMock()
+        mock_inbox_path.parent = mock_inbox_parent
+        mock_cc.__truediv__ = Mock(side_effect=lambda agent: MagicMock(
+            __truediv__=Mock(return_value=mock_inbox_path)
+        ))
+
+        mgr.sync_github_to_inbox()
+
+        # Verify write_text was called for each agent
+        assert mock_inbox_path.write_text.call_count >= 1
+
+    @patch("auto_manager.COMMAND_CENTER")
+    @patch("auto_manager._log_decision")
+    def test_sync_writes_inbox_with_ready_queue(self, mock_log, mock_cc):
+        """Writes INBOX.md with ready queue when ready tasks exist."""
+        mgr, mock_gh = self._make_manager()
+
+        def list_issues_side_effect(labels=None, state="open", **kwargs):
+            if labels and "status:in-progress" in labels:
+                return []
+            if labels and "status:ready" in labels:
+                return [
+                    self._make_issue_obj(10, "Task A", labels=["research", "status:ready", "P1"]),
+                    self._make_issue_obj(11, "Task B", labels=["research", "status:ready", "P0"]),
+                ]
+            return []
+
+        mock_gh.list_issues.side_effect = list_issues_side_effect
+
+        mock_inbox_path = MagicMock()
+        mock_inbox_parent = MagicMock()
+        mock_inbox_path.parent = mock_inbox_parent
+
+        written_content = {}
+
+        def capture_write(content, encoding="utf-8"):
+            written_content["last"] = content
+
+        mock_inbox_path.write_text = capture_write
+        mock_cc.__truediv__ = Mock(side_effect=lambda agent: MagicMock(
+            __truediv__=Mock(return_value=mock_inbox_path)
+        ))
+
+        mgr.sync_github_to_inbox()
+
+        # Check that at least one INBOX was written with ready queue content
+        content = written_content.get("last", "")
+        assert "READY QUEUE" in content or "NO TASKS" in content
+
+    @patch("auto_manager.COMMAND_CENTER")
+    @patch("auto_manager._log_decision")
+    def test_sync_writes_no_tasks_when_empty(self, mock_log, mock_cc):
+        """Writes NO TASKS section when no issues exist."""
+        mgr, mock_gh = self._make_manager()
+        mock_gh.list_issues.return_value = []
+
+        written_content = {}
+
+        def capture_write(content, encoding="utf-8"):
+            written_content["last"] = content
+
+        mock_inbox_path = MagicMock()
+        mock_inbox_path.parent = MagicMock()
+        mock_inbox_path.write_text = capture_write
+        mock_cc.__truediv__ = Mock(side_effect=lambda agent: MagicMock(
+            __truediv__=Mock(return_value=mock_inbox_path)
+        ))
+
+        mgr.sync_github_to_inbox()
+
+        content = written_content.get("last", "")
+        assert "NO TASKS" in content
+        assert "Awaiting new assignments" in content
+
+    @patch("auto_manager.COMMAND_CENTER")
+    @patch("auto_manager._log_decision")
+    def test_sync_includes_github_first_protocol(self, mock_log, mock_cc):
+        """INBOX.md always includes the GITHUB-FIRST PROTOCOL section."""
+        mgr, mock_gh = self._make_manager()
+        mock_gh.list_issues.return_value = []
+
+        written_content = {}
+
+        def capture_write(content, encoding="utf-8"):
+            written_content["last"] = content
+
+        mock_inbox_path = MagicMock()
+        mock_inbox_path.parent = MagicMock()
+        mock_inbox_path.write_text = capture_write
+        mock_cc.__truediv__ = Mock(side_effect=lambda agent: MagicMock(
+            __truediv__=Mock(return_value=mock_inbox_path)
+        ))
+
+        mgr.sync_github_to_inbox()
+
+        content = written_content.get("last", "")
+        assert "GITHUB-FIRST PROTOCOL" in content
+        assert "Comment on issue when starting" in content
+
+    @patch("auto_manager.COMMAND_CENTER")
+    @patch("auto_manager._log_decision")
+    def test_sync_handles_api_failure_gracefully(self, mock_log, mock_cc):
+        """Does not crash when GitHub API fails for one agent."""
+        mgr, mock_gh = self._make_manager()
+        mock_gh.list_issues.side_effect = Exception("API error")
+
+        # Should not raise
+        mgr.sync_github_to_inbox()
+
+    @patch("auto_manager.COMMAND_CENTER")
+    @patch("auto_manager._log_decision")
+    def test_sync_creates_parent_directories(self, mock_log, mock_cc):
+        """Creates parent directories for INBOX.md if they do not exist."""
+        mgr, mock_gh = self._make_manager()
+        mock_gh.list_issues.return_value = []
+
+        mock_inbox_path = MagicMock()
+        mock_inbox_parent = MagicMock()
+        mock_inbox_path.parent = mock_inbox_parent
+        mock_cc.__truediv__ = Mock(side_effect=lambda agent: MagicMock(
+            __truediv__=Mock(return_value=mock_inbox_path)
+        ))
+
+        mgr.sync_github_to_inbox()
+
+        # Verify mkdir was called with parents=True, exist_ok=True
+        mock_inbox_parent.mkdir.assert_called()
+        mkdir_kwargs = mock_inbox_parent.mkdir.call_args[1]
+        assert mkdir_kwargs.get("parents") is True
+        assert mkdir_kwargs.get("exist_ok") is True
+
+
+# ===========================================================================
+# TestAutoLoopWithProcessController
+# ===========================================================================
+
+class TestAutoLoopWithProcessController:
+    """Tests for ProcessController integration in run_auto_loop."""
+
+    def _make_manager(self):
+        """Return (AutoManager, mock_gh)."""
+        mock_gh = MagicMock(spec=GitHubConnector)
+        mock_gh.repo = "owner/repo"
+        from auto_manager import AutoManager
+        mgr = AutoManager(mock_gh)
+        return mgr, mock_gh
+
+    @patch("auto_manager.ProcessController")
+    @patch("auto_manager.time.sleep")
+    @patch("auto_manager._log_decision")
+    def test_auto_loop_checks_hetzner_connectivity(self, mock_log, mock_sleep, mock_pc_cls):
+        """Auto loop checks Hetzner connectivity via ProcessController."""
+        mgr, mock_gh = self._make_manager()
+
+        mock_gh.list_issues.return_value = []
+        mock_gh.get_comments.return_value = []
+        mock_gh.list_recently_closed.return_value = []
+
+        mock_pc = MagicMock()
+        mock_pc.check_hetzner_connectivity.return_value = True
+        mock_pc.count_kimi_sessions.return_value = 2
+        mock_pc_cls.return_value = mock_pc
+
+        mock_sleep.side_effect = KeyboardInterrupt()
+
+        mgr.run_auto_loop(interval=1)
+
+        mock_pc.check_hetzner_connectivity.assert_called_once()
+
+    @patch("auto_manager.ProcessController")
+    @patch("auto_manager.time.sleep")
+    @patch("auto_manager._log_decision")
+    def test_auto_loop_counts_kimi_sessions_when_reachable(self, mock_log, mock_sleep, mock_pc_cls):
+        """Auto loop counts Kimi sessions when Hetzner is reachable."""
+        mgr, mock_gh = self._make_manager()
+
+        mock_gh.list_issues.return_value = []
+        mock_gh.get_comments.return_value = []
+        mock_gh.list_recently_closed.return_value = []
+
+        mock_pc = MagicMock()
+        mock_pc.check_hetzner_connectivity.return_value = True
+        mock_pc.count_kimi_sessions.return_value = 3
+        mock_pc_cls.return_value = mock_pc
+
+        mock_sleep.side_effect = KeyboardInterrupt()
+
+        mgr.run_auto_loop(interval=1)
+
+        mock_pc.count_kimi_sessions.assert_called_once()
+
+    @patch("auto_manager.ProcessController")
+    @patch("auto_manager.time.sleep")
+    @patch("auto_manager._log_decision")
+    def test_auto_loop_skips_kimi_count_when_unreachable(self, mock_log, mock_sleep, mock_pc_cls):
+        """Auto loop does not count Kimi sessions when Hetzner is unreachable."""
+        mgr, mock_gh = self._make_manager()
+
+        mock_gh.list_issues.return_value = []
+        mock_gh.get_comments.return_value = []
+        mock_gh.list_recently_closed.return_value = []
+
+        mock_pc = MagicMock()
+        mock_pc.check_hetzner_connectivity.return_value = False
+        mock_pc_cls.return_value = mock_pc
+
+        mock_sleep.side_effect = KeyboardInterrupt()
+
+        mgr.run_auto_loop(interval=1)
+
+        mock_pc.check_hetzner_connectivity.assert_called_once()
+        mock_pc.count_kimi_sessions.assert_not_called()
+
+    @patch("auto_manager.ProcessController")
+    @patch("auto_manager.time.sleep")
+    @patch("auto_manager._log_decision")
+    def test_auto_loop_handles_process_controller_exception(self, mock_log, mock_sleep, mock_pc_cls):
+        """Auto loop continues if ProcessController raises an exception."""
+        mgr, mock_gh = self._make_manager()
+
+        mock_gh.list_issues.return_value = []
+        mock_gh.get_comments.return_value = []
+        mock_gh.list_recently_closed.return_value = []
+
+        mock_pc_cls.side_effect = Exception("SSH subsystem error")
+
+        mock_sleep.side_effect = KeyboardInterrupt()
+
+        # Should not raise
+        mgr.run_auto_loop(interval=1)
+
+        # Still should have called other loop steps
+        assert mock_gh.list_issues.call_count > 0
+
+    @patch("auto_manager.ProcessController")
+    @patch("auto_manager.time.sleep")
+    @patch("auto_manager._log_decision")
+    def test_auto_loop_calls_sync_github_to_inbox(self, mock_log, mock_sleep, mock_pc_cls):
+        """Auto loop calls sync_github_to_inbox during each cycle."""
+        mgr, mock_gh = self._make_manager()
+
+        mock_gh.list_issues.return_value = []
+        mock_gh.get_comments.return_value = []
+        mock_gh.list_recently_closed.return_value = []
+
+        mock_pc = MagicMock()
+        mock_pc.check_hetzner_connectivity.return_value = True
+        mock_pc.count_kimi_sessions.return_value = 1
+        mock_pc_cls.return_value = mock_pc
+
+        mock_sleep.side_effect = KeyboardInterrupt()
+
+        # Spy on sync_github_to_inbox
+        with patch.object(mgr, "sync_github_to_inbox") as mock_sync:
+            mgr.run_auto_loop(interval=1)
+            mock_sync.assert_called_once()

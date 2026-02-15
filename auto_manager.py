@@ -11,7 +11,6 @@ Author: Ahmed Adel Bakr Alderai
 from __future__ import annotations
 
 import logging
-import os
 import re
 import subprocess
 import time
@@ -54,11 +53,6 @@ _BG_GREEN = "\033[42m"
 _BG_YELLOW = "\033[43m"
 
 logger = logging.getLogger("auto_manager")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
 
 
 def _color(text: str, *codes: str) -> str:
@@ -598,11 +592,8 @@ class AutoManager:
                 promoted = 0
                 for issue in backlog[:deficit]:
                     try:
-                        self.gh.remove_label(
-                            issue["number"], "status:backlog"
-                        )
-                        self.gh.add_labels(
-                            issue["number"], ["status:ready"]
+                        self.gh.transition_status(
+                            issue["number"], "status:ready"
                         )
                         self.gh.add_comment(
                             issue["number"],
@@ -698,11 +689,8 @@ class AutoManager:
             if not unresolved:
                 # All dependencies satisfied -- unblock
                 try:
-                    self.gh.remove_label(
-                        issue["number"], "status:blocked"
-                    )
-                    self.gh.add_labels(
-                        issue["number"], ["status:ready"]
+                    self.gh.transition_status(
+                        issue["number"], "status:ready"
                     )
                     dep_list = ", ".join(f"#{d}" for d in deps)
                     self.gh.add_comment(
@@ -948,9 +936,25 @@ class AutoManager:
         if not script_path.exists():
             return None
 
+        # SEC-1 fix: Sanitize file paths — reject traversal and absolute paths
+        safe_files: list[str] = []
+        for f in files[:10]:
+            # Reject paths containing ".." or starting with "/"
+            if ".." in f or f.startswith("/"):
+                logger.warning("Rejected unsafe file path: %s", f)
+                continue
+            # Only allow alphanumeric, hyphens, underscores, dots, and forward slashes
+            if not re.match(r'^[\w./-]+$', f):
+                logger.warning("Rejected file path with special chars: %s", f)
+                continue
+            safe_files.append(f)
+
+        if not safe_files:
+            return None
+
         try:
             result = subprocess.run(
-                [str(script_path)] + files[:10],  # Limit file args
+                [str(script_path)] + safe_files,
                 capture_output=True,
                 text=True,
                 timeout=60,

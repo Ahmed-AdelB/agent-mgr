@@ -10,7 +10,7 @@ Author: Ahmed Adel Bakr Alderai
 from __future__ import annotations
 
 import argparse
-import signal
+import logging
 import sys
 import time
 from datetime import datetime, timezone
@@ -449,6 +449,12 @@ def build_parser() -> argparse.ArgumentParser:
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
     parser = build_parser()
     args = parser.parse_args()
 

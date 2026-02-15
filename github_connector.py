@@ -223,28 +223,46 @@ class GitHubConnector:
         cmd_str = " ".join(shlex.quote(a) for a in full_args)
         logger.debug("gh exec: %s", cmd_str)
 
-        try:
-            result = subprocess.run(
-                full_args,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise CLIExecutionError(
-                f"gh command timed out after {self.timeout}s",
-                cmd=cmd_str,
-            ) from exc
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                result = subprocess.run(
+                    full_args,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.timeout,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise CLIExecutionError(
+                    f"gh command timed out after {self.timeout}s",
+                    cmd=cmd_str,
+                ) from exc
 
-        if result.returncode != 0:
-            stderr = result.stderr.strip()
-            raise CLIExecutionError(
-                f"gh command failed (rc={result.returncode}): {stderr}",
-                cmd=cmd_str,
-                stderr=stderr,
-            )
+            if result.returncode != 0:
+                stderr = result.stderr.strip()
+                # Detect rate limiting and retry with backoff
+                if ("rate limit" in stderr.lower()
+                        or "api rate" in stderr.lower()
+                        or "403" in stderr):
+                    if attempt < max_retries - 1:
+                        wait = 2 ** (attempt + 1)  # 2, 4 seconds
+                        logger.warning(
+                            "Rate limited (attempt %d/%d), retrying in %ds: %s",
+                            attempt + 1, max_retries, wait, stderr[:100],
+                        )
+                        import time
+                        time.sleep(wait)
+                        continue
+                raise CLIExecutionError(
+                    f"gh command failed (rc={result.returncode}): {stderr}",
+                    cmd=cmd_str,
+                    stderr=stderr,
+                )
 
-        return result.stdout
+            return result.stdout
+
+        # Should not reach here, but satisfy type checker
+        raise CLIExecutionError("Exhausted retries", cmd=cmd_str)
 
     def _run_json(self, args: list[str]) -> Any:
         """Execute a ``gh`` command and parse its JSON output."""
@@ -452,6 +470,49 @@ class GitHubConnector:
         ])
         logger.info(
             "Removed label %r from issue #%d in %s", label, number, self.repo
+        )
+
+    def transition_status(self, number: int, new_status: str) -> None:
+        """Atomically transition an issue to *new_status*.
+
+        Removes any existing ``status:*`` labels before adding the new one,
+        preventing multiple status labels from coexisting (BUG-3 fix).
+
+        Parameters
+        ----------
+        number:
+            Issue number.
+        new_status:
+            The target status label (e.g. ``"status:ready"``).
+        """
+        if not new_status.startswith("status:"):
+            new_status = f"status:{new_status}"
+
+        # Get current labels to find existing status labels
+        issue_data = self._run_json([
+            "issue", "view", str(number),
+            "--repo", self.repo,
+            "--json", "labels",
+        ])
+        current_labels = issue_data.get("labels", [])
+        old_statuses = [
+            lb["name"] for lb in current_labels
+            if isinstance(lb, dict) and lb.get("name", "").startswith("status:")
+            and lb["name"] != new_status
+        ]
+
+        # Remove old status labels
+        for old in old_statuses:
+            try:
+                self.remove_label(number, old)
+            except CLIExecutionError:
+                logger.debug("Could not remove label %r from #%d", old, number)
+
+        # Add new status
+        self.add_label(number, new_status)
+        logger.info(
+            "Transitioned #%d to %s (removed: %s)",
+            number, new_status, old_statuses or "none",
         )
 
     def list_labels(self) -> list[Label]:

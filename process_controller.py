@@ -234,8 +234,8 @@ class ProcessController:
         bool
             True if the kill command succeeded, False otherwise.
         """
-        if not isinstance(pid, int) or pid <= 0:
-            logger.error("Invalid PID: %s", pid)
+        if not isinstance(pid, int) or pid <= 0 or pid > 4194304:
+            logger.error("Invalid PID: %s (must be integer between 1-4194304)", pid)
             return False
 
         logger.info("Killing kimi process PID=%d on Hetzner", pid)

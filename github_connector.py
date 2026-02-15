@@ -16,6 +16,7 @@ import json
 import logging
 import shlex
 import subprocess
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -137,6 +138,72 @@ class Comment:
 
 
 # ---------------------------------------------------------------------------
+# Circuit Breaker
+# ---------------------------------------------------------------------------
+
+
+class CircuitBreaker:
+    """Circuit breaker pattern for GitHub CLI operations.
+
+    After *failure_threshold* consecutive failures the circuit opens,
+    blocking all requests for *reset_timeout* seconds.  After the timeout
+    the circuit enters a half-open state and allows a single test request.
+    A success in half-open closes the circuit; a failure re-opens it.
+
+    States
+    ------
+    closed    : Normal operation, requests allowed.
+    open      : Requests blocked due to repeated failures.
+    half-open : One test request allowed to probe recovery.
+
+    Parameters
+    ----------
+    failure_threshold:
+        Number of consecutive failures before opening the circuit.
+    reset_timeout:
+        Seconds to wait before transitioning from open to half-open.
+    """
+
+    def __init__(
+        self,
+        failure_threshold: int = 5,
+        reset_timeout: int = 60,
+    ) -> None:
+        self.failure_count: int = 0
+        self.failure_threshold: int = failure_threshold
+        self.reset_timeout: int = reset_timeout
+        self.last_failure_time: float = 0.0
+        self.state: str = "closed"  # closed, open, half-open
+
+    def record_success(self) -> None:
+        """Record a successful request -- reset failures and close the circuit."""
+        self.failure_count = 0
+        self.state = "closed"
+
+    def record_failure(self) -> None:
+        """Record a failed request -- may open or re-open the circuit."""
+        self.failure_count += 1
+        self.last_failure_time = time.time()
+        if self.state == "half-open":
+            # Any failure during the test request re-opens immediately
+            self.state = "open"
+        elif self.failure_count >= self.failure_threshold:
+            self.state = "open"
+
+    def allow_request(self) -> bool:
+        """Return True if a request is allowed to proceed."""
+        if self.state == "closed":
+            return True
+        if self.state == "open":
+            if time.time() - self.last_failure_time > self.reset_timeout:
+                self.state = "half-open"
+                return True
+            return False
+        # half-open: allow the single test request
+        return True
+
+
+# ---------------------------------------------------------------------------
 # Connector
 # ---------------------------------------------------------------------------
 
@@ -167,6 +234,10 @@ class GitHubConnector:
         self.repo = repo
         self.timeout = timeout
         self._verify_cli()
+        self._circuit_breaker = CircuitBreaker(
+            failure_threshold=5,
+            reset_timeout=60,
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -209,15 +280,27 @@ class GitHubConnector:
     def _run(self, args: list[str]) -> str:
         """Execute a ``gh`` command and return its stdout.
 
-        Uses list-mode ``subprocess.run`` (no shell) for safety — each
+        Uses list-mode ``subprocess.run`` (no shell) for safety -- each
         argument is passed directly to the process without shell
         interpretation, preventing injection.
+
+        Integrates with the circuit breaker: if the circuit is open,
+        raises ``CLIExecutionError`` immediately without calling ``gh``.
 
         Raises
         ------
         CLIExecutionError
-            When ``gh`` exits with a non-zero return code.
+            When ``gh`` exits with a non-zero return code or the circuit
+            breaker is open.
         """
+        # --- Circuit breaker gate ---
+        if not self._circuit_breaker.allow_request():
+            raise CLIExecutionError(
+                "Circuit breaker is OPEN -- GitHub API requests blocked "
+                f"(failures={self._circuit_breaker.failure_count}, "
+                f"retry after {self._circuit_breaker.reset_timeout}s)",
+            )
+
         full_args: list[str] = ["gh"] + args
         # Log with shlex.quote for readability, but pass raw list to subprocess
         cmd_str = " ".join(shlex.quote(a) for a in full_args)
@@ -233,6 +316,7 @@ class GitHubConnector:
                     timeout=self.timeout,
                 )
             except subprocess.TimeoutExpired as exc:
+                self._circuit_breaker.record_failure()
                 raise CLIExecutionError(
                     f"gh command timed out after {self.timeout}s",
                     cmd=cmd_str,
@@ -244,21 +328,26 @@ class GitHubConnector:
                 if ("rate limit" in stderr.lower()
                         or "api rate" in stderr.lower()
                         or "403" in stderr):
+                    self._circuit_breaker.record_failure()
                     if attempt < max_retries - 1:
                         wait = 2 ** (attempt + 1)  # 2, 4 seconds
                         logger.warning(
                             "Rate limited (attempt %d/%d), retrying in %ds: %s",
                             attempt + 1, max_retries, wait, stderr[:100],
                         )
-                        import time
                         time.sleep(wait)
                         continue
+                    # Last attempt exhausted -- fall through to raise
+                else:
+                    self._circuit_breaker.record_failure()
+
                 raise CLIExecutionError(
                     f"gh command failed (rc={result.returncode}): {stderr}",
                     cmd=cmd_str,
                     stderr=stderr,
                 )
 
+            self._circuit_breaker.record_success()
             return result.stdout
 
         # Should not reach here, but satisfy type checker

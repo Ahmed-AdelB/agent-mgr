@@ -11,9 +11,11 @@ Author: Ahmed Adel Bakr Alderai
 from __future__ import annotations
 
 import logging
+import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -203,8 +205,32 @@ def _log_decision(
             entry += f"**Rationale:** {rationale}\n"
         entry += f"**Source:** auto_manager.py (automated)\n"
 
-        with DECISIONS_PATH.open("a", encoding="utf-8") as fh:
-            fh.write(entry)
+        try:
+            # Read current content safely
+            if DECISIONS_PATH.exists():
+                with DECISIONS_PATH.open("r", encoding="utf-8") as fh:
+                    content = fh.read()
+            else:
+                content = ""
+            
+            # Append new entry
+            new_content = content + entry
+            
+            # Write atomically
+            fd, tmp = tempfile.mkstemp(dir=str(DECISIONS_PATH.parent), suffix=".tmp")
+            try:
+                os.write(fd, new_content.encode('utf-8'))
+                os.close(fd)
+                os.replace(tmp, str(DECISIONS_PATH))
+            except Exception:
+                os.close(fd)
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+        except Exception as exc:
+            logger.warning("Failed to write decision log: %s", exc)
     except OSError as exc:
         logger.warning("Failed to write decision log: %s", exc)
 
@@ -733,6 +759,7 @@ class AutoManager:
         # Also consider closed issues as resolved dependencies
         closed_issues_raw = self.gh.list_issues(
             state="closed",
+            limit=200,
         )
         closed_issues = [
             {"number": iss.number}
@@ -1024,10 +1051,27 @@ class AutoManager:
                 lines.append("4. Comment with results when done")
                 lines.append("")
 
-                # Write the INBOX.md file
+                # Write the INBOX.md file atomically
                 inbox_path = COMMAND_CENTER / agent_name / "INBOX.md"
                 inbox_path.parent.mkdir(parents=True, exist_ok=True)
-                inbox_path.write_text("\n".join(lines), encoding="utf-8")
+                content = "\n".join(lines)
+                
+                try:
+                    fd, tmp = tempfile.mkstemp(dir=str(inbox_path.parent), suffix=".tmp")
+                    try:
+                        os.write(fd, content.encode('utf-8'))
+                        os.close(fd)
+                        os.replace(tmp, str(inbox_path))
+                    except Exception:
+                        os.close(fd)
+                        try:
+                            os.unlink(tmp)
+                        except OSError:
+                            pass
+                        raise
+                except Exception as exc:
+                    logger.error("Failed to write INBOX.md for %s: %s", agent_name, exc)
+                    raise
 
                 logger.info(
                     "Synced INBOX.md for %s (%d in-progress, %d ready)",

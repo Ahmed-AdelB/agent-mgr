@@ -2116,9 +2116,8 @@ class TestSyncGitHubToInbox:
             updated_at="2025-01-01T01:00:00Z",
         )
 
-    @patch("auto_manager.COMMAND_CENTER")
     @patch("auto_manager._log_decision")
-    def test_sync_writes_inbox_with_in_progress_tasks(self, mock_log, mock_cc):
+    def test_sync_writes_inbox_with_in_progress_tasks(self, mock_log, tmp_path):
         """Writes INBOX.md with current assignment when in-progress tasks exist."""
         mgr, mock_gh = self._make_manager()
 
@@ -2126,22 +2125,15 @@ class TestSyncGitHubToInbox:
             self._make_issue_obj(42, "Build auth module", labels=["builder", "status:in-progress", "P0"]),
         ]
 
-        # Use a temp path for COMMAND_CENTER
-        mock_inbox_path = MagicMock()
-        mock_inbox_parent = MagicMock()
-        mock_inbox_path.parent = mock_inbox_parent
-        mock_cc.__truediv__ = Mock(side_effect=lambda agent: MagicMock(
-            __truediv__=Mock(return_value=mock_inbox_path)
-        ))
+        with patch("auto_manager.COMMAND_CENTER", tmp_path):
+            mgr.sync_github_to_inbox()
 
-        mgr.sync_github_to_inbox()
+        # Verify at least one INBOX.md was written
+        inbox_files = list(tmp_path.rglob("INBOX.md"))
+        assert len(inbox_files) >= 1
 
-        # Verify write_text was called for each agent
-        assert mock_inbox_path.write_text.call_count >= 1
-
-    @patch("auto_manager.COMMAND_CENTER")
     @patch("auto_manager._log_decision")
-    def test_sync_writes_inbox_with_ready_queue(self, mock_log, mock_cc):
+    def test_sync_writes_inbox_with_ready_queue(self, mock_log, tmp_path):
         """Writes INBOX.md with ready queue when ready tasks exist."""
         mgr, mock_gh = self._make_manager()
 
@@ -2157,73 +2149,42 @@ class TestSyncGitHubToInbox:
 
         mock_gh.list_issues.side_effect = list_issues_side_effect
 
-        mock_inbox_path = MagicMock()
-        mock_inbox_parent = MagicMock()
-        mock_inbox_path.parent = mock_inbox_parent
-
-        written_content = {}
-
-        def capture_write(content, encoding="utf-8"):
-            written_content["last"] = content
-
-        mock_inbox_path.write_text = capture_write
-        mock_cc.__truediv__ = Mock(side_effect=lambda agent: MagicMock(
-            __truediv__=Mock(return_value=mock_inbox_path)
-        ))
-
-        mgr.sync_github_to_inbox()
+        with patch("auto_manager.COMMAND_CENTER", tmp_path):
+            mgr.sync_github_to_inbox()
 
         # Check that at least one INBOX was written with ready queue content
-        content = written_content.get("last", "")
+        inbox_files = list(tmp_path.rglob("INBOX.md"))
+        assert len(inbox_files) >= 1
+        content = inbox_files[0].read_text()
         assert "READY QUEUE" in content or "NO TASKS" in content
 
-    @patch("auto_manager.COMMAND_CENTER")
     @patch("auto_manager._log_decision")
-    def test_sync_writes_no_tasks_when_empty(self, mock_log, mock_cc):
+    def test_sync_writes_no_tasks_when_empty(self, mock_log, tmp_path):
         """Writes NO TASKS section when no issues exist."""
         mgr, mock_gh = self._make_manager()
         mock_gh.list_issues.return_value = []
 
-        written_content = {}
+        with patch("auto_manager.COMMAND_CENTER", tmp_path):
+            mgr.sync_github_to_inbox()
 
-        def capture_write(content, encoding="utf-8"):
-            written_content["last"] = content
-
-        mock_inbox_path = MagicMock()
-        mock_inbox_path.parent = MagicMock()
-        mock_inbox_path.write_text = capture_write
-        mock_cc.__truediv__ = Mock(side_effect=lambda agent: MagicMock(
-            __truediv__=Mock(return_value=mock_inbox_path)
-        ))
-
-        mgr.sync_github_to_inbox()
-
-        content = written_content.get("last", "")
+        inbox_files = list(tmp_path.rglob("INBOX.md"))
+        assert len(inbox_files) >= 1
+        content = inbox_files[0].read_text()
         assert "NO TASKS" in content
         assert "Awaiting new assignments" in content
 
-    @patch("auto_manager.COMMAND_CENTER")
     @patch("auto_manager._log_decision")
-    def test_sync_includes_github_first_protocol(self, mock_log, mock_cc):
+    def test_sync_includes_github_first_protocol(self, mock_log, tmp_path):
         """INBOX.md always includes the GITHUB-FIRST PROTOCOL section."""
         mgr, mock_gh = self._make_manager()
         mock_gh.list_issues.return_value = []
 
-        written_content = {}
+        with patch("auto_manager.COMMAND_CENTER", tmp_path):
+            mgr.sync_github_to_inbox()
 
-        def capture_write(content, encoding="utf-8"):
-            written_content["last"] = content
-
-        mock_inbox_path = MagicMock()
-        mock_inbox_path.parent = MagicMock()
-        mock_inbox_path.write_text = capture_write
-        mock_cc.__truediv__ = Mock(side_effect=lambda agent: MagicMock(
-            __truediv__=Mock(return_value=mock_inbox_path)
-        ))
-
-        mgr.sync_github_to_inbox()
-
-        content = written_content.get("last", "")
+        inbox_files = list(tmp_path.rglob("INBOX.md"))
+        assert len(inbox_files) >= 1
+        content = inbox_files[0].read_text()
         assert "GITHUB-FIRST PROTOCOL" in content
         assert "Comment on issue when starting" in content
 

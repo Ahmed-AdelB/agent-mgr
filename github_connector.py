@@ -602,13 +602,16 @@ class GitHubConnector:
     # Convenience methods (used by agent_mgr.py CLI)
     # ------------------------------------------------------------------
 
-    _AGENT_CONFIG: dict[str, dict[str, str]] = {
-        "researcher": {"label": "research", "role_label": "role:researcher"},
-        "builder": {"label": "builder", "role_label": "role:builder"},
-        "localkimi": {"label": "kimi", "role_label": "role:kimi"},
-    }
+    @staticmethod
+    def _get_agent_config() -> dict[str, dict[str, str]]:
+        """Load agent config from config.py, mapping keys for CLI compatibility."""
+        from config import AGENTS, STALE_HOURS
+        return AGENTS
 
-    _STALE_HOURS: float = 4.0
+    @staticmethod
+    def _get_stale_hours() -> float:
+        from config import STALE_HOURS
+        return float(STALE_HOURS)
 
     def add_labels(self, number: int, labels: list[str]) -> None:
         """Add multiple labels to an issue."""
@@ -653,7 +656,7 @@ class GitHubConnector:
         - ``stale_hours``: ``float``
         - ``current_issue``: ``dict | None``
         """
-        cfg = self._AGENT_CONFIG.get(agent)
+        cfg = self._get_agent_config().get(agent)
         if cfg is None:
             return {
                 "last_activity": None,
@@ -684,7 +687,7 @@ class GitHubConnector:
 
         return {
             "last_activity": latest,
-            "healthy": stale_hours < self._STALE_HOURS if latest else False,
+            "healthy": stale_hours < self._get_stale_hours() if latest else False,
             "stale_hours": round(stale_hours, 1),
             "current_issue": current_issue,
         }
@@ -694,7 +697,7 @@ class GitHubConnector:
 
         Returns ``{"ready": N, "in_progress": N, "total": N}``.
         """
-        cfg = self._AGENT_CONFIG.get(agent)
+        cfg = self._get_agent_config().get(agent)
         if cfg is None:
             return {"ready": 0, "in_progress": 0, "total": 0}
 
@@ -717,7 +720,7 @@ class GitHubConnector:
 
     def agent_queue_issues(self, agent: str) -> list[dict[str, Any]]:
         """Return all open issues for *agent* as plain dicts."""
-        cfg = self._AGENT_CONFIG.get(agent)
+        cfg = self._get_agent_config().get(agent)
         if cfg is None:
             return []
 

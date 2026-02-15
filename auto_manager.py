@@ -19,33 +19,21 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from config import (
+    AGENTS,
+    PRIORITY_LABELS,
+    REPO,
+    STATUS_LABELS,
+    DECISIONS_FILE,
+    VALIDATE_SCRIPT,
+    STALE_HOURS,
+    DEAD_HOURS,
+    MIN_READY_TASKS,
+    AUTO_LOOP_INTERVAL,
+)
 from github_connector import GitHubConnector
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-REPO: str = "Ahmed-AdelB/ummro"
-
-AGENTS: dict[str, dict[str, str]] = {
-    "researcher": {"label": "research", "role_label": "role:researcher"},
-    "builder": {"label": "builder", "role_label": "role:builder"},
-    "kimi": {"label": "kimi", "role_label": "role:kimi"},
-}
-
-PRIORITY_LABELS: list[str] = ["P0", "P1", "P2", "P3"]
-
-STATUS_LABELS: list[str] = [
-    "status:backlog",
-    "status:ready",
-    "status:in-progress",
-    "status:blocked",
-    "status:needs-review",
-    "status:approved",
-    "status:rejected",
-]
-
-DECISIONS_PATH: Path = Path.home() / ".claude" / "command-center" / "DECISIONS.md"
+DECISIONS_PATH: Path = DECISIONS_FILE
 
 # ---------------------------------------------------------------------------
 # ANSI helpers (no external deps)
@@ -956,7 +944,7 @@ class AutoManager:
 
     def _run_quality_script(self, files: list[str]) -> str | None:
         """Run validate-quality.sh if it exists.  Returns failure reason or None."""
-        script_path = Path.home() / ".claude" / "scripts" / "validate-quality.sh"
+        script_path = VALIDATE_SCRIPT
         if not script_path.exists():
             return None
 

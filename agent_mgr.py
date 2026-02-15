@@ -16,31 +16,25 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+from config import (
+    AGENTS as AGENTS_CONFIG,
+    ALL_LABELS,
+    REPO,
+    AUTO_LOOP_INTERVAL,
+)
 from github_connector import GitHubConnector
 from auto_manager import AutoManager
 
-# ── Default configuration ────────────────────────────────────────────────────
+# ── Derived configuration ────────────────────────────────────────────────────
 
-DEFAULT_REPO: str = "Ahmed-AdelB/ummro"
+DEFAULT_REPO: str = REPO
 
-AGENTS: list[str] = ["researcher", "builder", "localkimi"]
+# Agent names list (for CLI choices)
+AGENTS: list[str] = list(AGENTS_CONFIG.keys())
 
-LABELS: list[tuple[str, str, str]] = [
-    ("status:backlog", "E4E669", "Task planned but not active"),
-    ("status:ready", "0E8A16", "Ready for agent to pick up"),
-    ("status:in-progress", "1D76DB", "Agent actively working"),
-    ("status:blocked", "D93F0B", "Agent blocked, needs help"),
-    ("status:needs-review", "FBCA04", "Work done, review needed"),
-    ("status:approved", "0E8A16", "Approved by Manager"),
-    ("status:rejected", "B60205", "Rejected, needs revision"),
-    ("role:builder", "5319E7", "Assigned to Builder agent"),
-    ("role:researcher", "0ABFBC", "Assigned to Researcher agent"),
-    ("role:kimi", "00BCD4", "Assigned to localkimi agent"),
-    ("qa:passed", "2EA44F", "Automated QA passed"),
-    ("qa:failed", "CB2431", "Automated QA failed"),
-]
+LABELS: list[tuple[str, str, str]] = ALL_LABELS
 
-AUTO_LOOP_INTERVAL_SECONDS: int = 300  # 5 minutes
+AUTO_LOOP_INTERVAL_SECONDS: int = AUTO_LOOP_INTERVAL
 
 # ── ANSI colour helpers ──────────────────────────────────────────────────────
 
@@ -303,7 +297,11 @@ def cmd_directive(gh: GitHubConnector, agent: str, message: str) -> None:
 
 
 def cmd_auto(gh: GitHubConnector) -> None:
-    """Run the autonomous management loop (5-min interval)."""
+    """Run the autonomous management loop (5-min interval).
+
+    Delegates to AutoManager.run_auto_loop() which has full per-step
+    error handling, rate-limit awareness, and clean shutdown.
+    """
     manager = AutoManager(gh)
 
     print(f"[{_now_ts()}] Starting autonomous management loop...")
@@ -311,54 +309,7 @@ def cmd_auto(gh: GitHubConnector) -> None:
     print(f"[{_now_ts()}] Interval: {AUTO_LOOP_INTERVAL_SECONDS}s")
     print()
 
-    try:
-        while True:
-            _run_auto_cycle(gh, manager)
-            print(f"[{_now_ts()}] Next check in {AUTO_LOOP_INTERVAL_SECONDS // 60} minutes...")
-            print()
-            time.sleep(AUTO_LOOP_INTERVAL_SECONDS)
-    except KeyboardInterrupt:
-        print()
-        print(yellow(f"[{_now_ts()}] Autonomous loop stopped by user."))
-        sys.exit(0)
-
-
-def _run_auto_cycle(gh: GitHubConnector, manager: AutoManager) -> None:
-    """Execute a single iteration of the autonomous management loop."""
-    # 1. Health check all agents
-    health_summary_parts: list[str] = []
-    stale_agents: list[str] = []
-    for agent in AGENTS:
-        health = gh.agent_health(agent)
-        healthy: bool = health.get("healthy", False)
-        if healthy:
-            health_summary_parts.append(f"{agent}=healthy")
-        else:
-            stale_hours = health.get("stale_hours", 0)
-            health_summary_parts.append(f"{agent}=stale({stale_hours}h)")
-            stale_agents.append(agent)
-
-    print(f"[{_now_ts()}] Health: {', '.join(health_summary_parts)}")
-
-    # 2. Nudge stale agents
-    if stale_agents:
-        print(f"[{_now_ts()}] Nudging stale agents...")
-        manager.nudge_stale()
-
-    # 3. Queue management
-    print(f"[{_now_ts()}] Replenishing queues...")
-    manager.replenish_queues()
-
-    # 4. Dependency resolution
-    print(f"[{_now_ts()}] Checking dependencies...")
-    manager.check_dependencies()
-
-    # 5. Review queue
-    review_items = manager.review_queue()
-    for item in review_items:
-        number = item.get("number", "?")
-        print(f"[{_now_ts()}] Review: #{number} needs review, running auto-QA...")
-        manager.auto_review(number)
+    manager.run_auto_loop(interval=AUTO_LOOP_INTERVAL_SECONDS)
 
 
 def cmd_labels_setup(gh: GitHubConnector) -> None:

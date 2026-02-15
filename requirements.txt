@@ -1,0 +1,2 @@
+# No external dependencies — uses only Python stdlib + gh CLI
+# Python 3.11+ required

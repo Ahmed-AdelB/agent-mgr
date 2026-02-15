@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import re
 import subprocess
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,6 +35,25 @@ from config import (
 )
 from github_connector import GitHubConnector
 from process_controller import ProcessController
+
+# ---------------------------------------------------------------------------
+# Resource Allocator integration (graceful degradation)
+# ---------------------------------------------------------------------------
+
+sys.path.insert(0, str(Path.home() / "projects" / "PM" / "src"))
+try:
+    from leadership.resource_allocator import ResourceAllocator, ResourceType
+    RESOURCE_AWARE = True
+except ImportError:
+    RESOURCE_AWARE = False
+
+# Agent name -> ResourceType member name mapping
+_AGENT_RESOURCE_MAP: dict[str, str] = {
+    "researcher": "CLAUDE_SUB",
+    "builder": "CLAUDE_SUB",
+    "kimi": "KIMI_CLI",
+}
+
 
 DECISIONS_PATH: Path = DECISIONS_FILE
 
@@ -280,6 +300,25 @@ class AutoManager:
                     f"  {agent_name:<14} {_color('ERROR', _RED):<24} "
                     f"{str(exc)[:50]}"
                 )
+
+        # --- Resource status ---
+        lines.append("")
+        lines.append(_color("  RESOURCE STATUS", _BOLD, _BLUE))
+        lines.append(_color("  " + "-" * 80, _DIM))
+
+        resource_status = self._get_resource_status()
+        if resource_status:
+            for rtype, info in resource_status.items():
+                if info["available"]:
+                    badge = _color("AVAILABLE", _GREEN)
+                else:
+                    badge = _color("EXHAUSTED", _RED)
+                lines.append(
+                    f"  {rtype:<20} {badge:<24} "
+                    f"({info['available_count']}/{info['total_count']} available)"
+                )
+        else:
+            lines.append(_color("  (resource tracking not available)", _DIM))
 
         # --- Review queue ---
         lines.append("")
@@ -599,6 +638,19 @@ class AutoManager:
         """
         for agent_name, cfg in AGENTS.items():
             try:
+                # Check resource availability before replenishing
+                if not self._check_agent_resources(agent_name):
+                    _log_decision(
+                        "Queue Replenishment Skipped",
+                        f"Skipped {agent_name}: resources exhausted or rate-limited",
+                        f"Resource type: {_AGENT_RESOURCE_MAP.get(agent_name, 'unknown')}",
+                    )
+                    logger.info(
+                        "Skipping replenish for %s: resources unavailable",
+                        agent_name,
+                    )
+                    continue
+
                 ready = self._get_agent_issues(agent_name, status="status:ready")
                 deficit = min_ready - len(ready)
 
@@ -1155,6 +1207,87 @@ class AutoManager:
                 f"Unknown agent '{agent}'. Valid agents: "
                 + ", ".join(AGENTS.keys())
             )
+
+
+    def _check_agent_resources(self, agent: str) -> bool:
+        """Check whether the agent's resource type has available capacity.
+
+        Maps agent names to resource types:
+        - researcher -> CLAUDE_SUB
+        - builder    -> CLAUDE_SUB
+        - kimi       -> KIMI_CLI
+
+        Returns True if resources are available, if RESOURCE_AWARE is False
+        (graceful degradation), or if the agent has no mapped resource type.
+        Returns False if the resource is rate-limited or exhausted.
+        """
+        if not RESOURCE_AWARE:
+            return True
+
+        resource_type_name = _AGENT_RESOURCE_MAP.get(agent)
+        if resource_type_name is None:
+            return True
+
+        try:
+            resource_type = ResourceType[resource_type_name]
+            allocator = ResourceAllocator(persist=False)
+            available = allocator.list_resources(
+                resource_type=resource_type,
+                available_only=True,
+            )
+            if available:
+                return True
+
+            # Check if any resources exist at all for this type
+            all_of_type = allocator.list_resources(resource_type=resource_type)
+            if not all_of_type:
+                # No resources registered for this type -- allow (fail-open)
+                return True
+
+            logger.info(
+                "No available resources for %s (type=%s, total=%d)",
+                agent,
+                resource_type_name,
+                len(all_of_type),
+            )
+            return False
+
+        except Exception as exc:
+            logger.warning(
+                "Resource check failed for %s: %s (allowing)", agent, exc
+            )
+            return True
+
+    def _get_resource_status(self) -> dict[str, dict[str, Any]] | None:
+        """Return resource availability summary per resource type.
+
+        Returns None if resource tracking is not available.
+        Returns a dict mapping resource type names to availability info.
+        """
+        if not RESOURCE_AWARE:
+            return None
+
+        try:
+            allocator = ResourceAllocator(persist=False)
+            status: dict[str, dict[str, Any]] = {}
+
+            for rtype in ResourceType:
+                all_resources = allocator.list_resources(resource_type=rtype)
+                available = allocator.list_resources(
+                    resource_type=rtype, available_only=True
+                )
+                if all_resources:
+                    status[rtype.value] = {
+                        "available": len(available) > 0,
+                        "available_count": len(available),
+                        "total_count": len(all_resources),
+                    }
+
+            return status if status else None
+
+        except Exception as exc:
+            logger.warning("Failed to get resource status: %s", exc)
+            return None
 
     def _get_agent_issues(
         self,

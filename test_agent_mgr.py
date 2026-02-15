@@ -2734,3 +2734,325 @@ class TestDryRunCLI:
         args = parser.parse_args(["auto"])
         assert args.command == "auto"
         assert args.dry_run is False
+
+
+# ===========================================================================
+# TestResourceAllocatorIntegration
+# ===========================================================================
+
+class TestResourceAllocatorIntegration:
+    """Tests for ResourceAllocator integration in AutoManager."""
+
+    def _make_manager(self):
+        """Return (AutoManager, mock_gh)."""
+        mock_gh = MagicMock(spec=GitHubConnector)
+        mock_gh.repo = "owner/repo"
+        from auto_manager import AutoManager
+        mgr = AutoManager(mock_gh)
+        return mgr, mock_gh
+
+    def _make_issue_obj(
+        self,
+        number: int = 1,
+        title: str = "Test",
+        body: str = "body",
+        labels: list | None = None,
+    ) -> Issue:
+        return Issue(
+            number=number,
+            title=title,
+            state="OPEN",
+            body=body,
+            labels=labels or [],
+            url=f"https://github.com/owner/repo/issues/{number}",
+            created_at="2025-01-01T00:00:00Z",
+            updated_at="2025-01-01T01:00:00Z",
+        )
+
+    # ------------------------------------------------------------------
+    # _check_agent_resources returns True when RESOURCE_AWARE is False
+    # ------------------------------------------------------------------
+
+    @patch("auto_manager.RESOURCE_AWARE", False)
+    @patch("auto_manager._log_decision")
+    def test_check_agent_resources_returns_true_when_not_resource_aware(self, mock_log):
+        """Returns True when RESOURCE_AWARE is False (graceful degradation)."""
+        mgr, mock_gh = self._make_manager()
+        assert mgr._check_agent_resources("researcher") is True
+        assert mgr._check_agent_resources("builder") is True
+        assert mgr._check_agent_resources("kimi") is True
+
+    # ------------------------------------------------------------------
+    # _check_agent_resources maps agents to correct ResourceType
+    # ------------------------------------------------------------------
+
+    @patch("auto_manager.RESOURCE_AWARE", True)
+    @patch("auto_manager.ResourceAllocator")
+    @patch("auto_manager._log_decision")
+    def test_check_agent_resources_maps_researcher_to_claude_sub(self, mock_log, mock_allocator_cls):
+        """researcher maps to CLAUDE_SUB resource type."""
+        mgr, mock_gh = self._make_manager()
+        mock_allocator = MagicMock()
+        mock_allocator.list_resources.return_value = [MagicMock()]  # available
+        mock_allocator_cls.return_value = mock_allocator
+
+        result = mgr._check_agent_resources("researcher")
+
+        assert result is True
+        # Verify ResourceType.CLAUDE_SUB was used
+        from auto_manager import ResourceType
+        mock_allocator.list_resources.assert_called_with(
+            resource_type=ResourceType.CLAUDE_SUB,
+            available_only=True,
+        )
+
+    @patch("auto_manager.RESOURCE_AWARE", True)
+    @patch("auto_manager.ResourceAllocator")
+    @patch("auto_manager._log_decision")
+    def test_check_agent_resources_maps_builder_to_claude_sub(self, mock_log, mock_allocator_cls):
+        """builder maps to CLAUDE_SUB resource type."""
+        mgr, mock_gh = self._make_manager()
+        mock_allocator = MagicMock()
+        mock_allocator.list_resources.return_value = [MagicMock()]
+        mock_allocator_cls.return_value = mock_allocator
+
+        result = mgr._check_agent_resources("builder")
+
+        assert result is True
+        from auto_manager import ResourceType
+        mock_allocator.list_resources.assert_called_with(
+            resource_type=ResourceType.CLAUDE_SUB,
+            available_only=True,
+        )
+
+    @patch("auto_manager.RESOURCE_AWARE", True)
+    @patch("auto_manager.ResourceAllocator")
+    @patch("auto_manager._log_decision")
+    def test_check_agent_resources_maps_kimi_to_kimi_cli(self, mock_log, mock_allocator_cls):
+        """kimi maps to KIMI_CLI resource type."""
+        mgr, mock_gh = self._make_manager()
+        mock_allocator = MagicMock()
+        mock_allocator.list_resources.return_value = [MagicMock()]
+        mock_allocator_cls.return_value = mock_allocator
+
+        result = mgr._check_agent_resources("kimi")
+
+        assert result is True
+        from auto_manager import ResourceType
+        mock_allocator.list_resources.assert_called_with(
+            resource_type=ResourceType.KIMI_CLI,
+            available_only=True,
+        )
+
+    # ------------------------------------------------------------------
+    # _check_agent_resources returns False when exhausted
+    # ------------------------------------------------------------------
+
+    @patch("auto_manager.RESOURCE_AWARE", True)
+    @patch("auto_manager.ResourceAllocator")
+    @patch("auto_manager._log_decision")
+    def test_check_agent_resources_returns_false_when_exhausted(self, mock_log, mock_allocator_cls):
+        """Returns False when all resources of the type are exhausted."""
+        mgr, mock_gh = self._make_manager()
+        mock_allocator = MagicMock()
+
+        def list_resources_side_effect(resource_type=None, available_only=False):
+            if available_only:
+                return []  # None available
+            return [MagicMock()]  # But resources exist (just exhausted)
+
+        mock_allocator.list_resources.side_effect = list_resources_side_effect
+        mock_allocator_cls.return_value = mock_allocator
+
+        result = mgr._check_agent_resources("researcher")
+
+        assert result is False
+
+    # ------------------------------------------------------------------
+    # _check_agent_resources returns True when no resources registered (fail-open)
+    # ------------------------------------------------------------------
+
+    @patch("auto_manager.RESOURCE_AWARE", True)
+    @patch("auto_manager.ResourceAllocator")
+    @patch("auto_manager._log_decision")
+    def test_check_agent_resources_returns_true_when_none_registered(self, mock_log, mock_allocator_cls):
+        """Returns True (fail-open) when no resources are registered for the type."""
+        mgr, mock_gh = self._make_manager()
+        mock_allocator = MagicMock()
+        mock_allocator.list_resources.return_value = []  # No resources at all
+        mock_allocator_cls.return_value = mock_allocator
+
+        result = mgr._check_agent_resources("researcher")
+
+        assert result is True
+
+    # ------------------------------------------------------------------
+    # _check_agent_resources returns True on exception (fail-open)
+    # ------------------------------------------------------------------
+
+    @patch("auto_manager.RESOURCE_AWARE", True)
+    @patch("auto_manager.ResourceAllocator")
+    @patch("auto_manager._log_decision")
+    def test_check_agent_resources_returns_true_on_exception(self, mock_log, mock_allocator_cls):
+        """Returns True when ResourceAllocator raises an exception."""
+        mgr, mock_gh = self._make_manager()
+        mock_allocator_cls.side_effect = Exception("Cannot load resources")
+
+        result = mgr._check_agent_resources("researcher")
+
+        assert result is True
+
+    # ------------------------------------------------------------------
+    # replenish_queues skips agents with exhausted resources
+    # ------------------------------------------------------------------
+
+    @patch("auto_manager.RESOURCE_AWARE", True)
+    @patch("auto_manager.ResourceAllocator")
+    @patch("auto_manager._log_decision")
+    def test_replenish_queues_skips_exhausted_agents(self, mock_log, mock_allocator_cls):
+        """replenish_queues skips agents whose resources are exhausted."""
+        mgr, mock_gh = self._make_manager()
+        mock_allocator = MagicMock()
+
+        def list_resources_side_effect(resource_type=None, available_only=False):
+            if available_only:
+                return []  # None available
+            return [MagicMock()]  # But resources exist (just exhausted)
+
+        mock_allocator.list_resources.side_effect = list_resources_side_effect
+        mock_allocator_cls.return_value = mock_allocator
+
+        # Set up backlog issues -- these should NOT be promoted
+        backlog_issues = [
+            self._make_issue_obj(10, "Backlog1", labels=["research", "status:backlog", "P1"]),
+        ]
+
+        def list_issues_side_effect(labels=None, state="open", **kwargs):
+            if labels and "status:ready" in labels:
+                return []  # empty ready queue
+            if labels and "status:backlog" in labels:
+                return backlog_issues
+            return []
+
+        mock_gh.list_issues.side_effect = list_issues_side_effect
+
+        mgr.replenish_queues(min_ready=2)
+
+        # No promotions should have happened since all agents are resource-exhausted
+        mock_gh.transition_status.assert_not_called()
+
+    @patch("auto_manager.RESOURCE_AWARE", True)
+    @patch("auto_manager.ResourceAllocator")
+    @patch("auto_manager._log_decision")
+    def test_replenish_queues_logs_decision_when_skipping(self, mock_log, mock_allocator_cls):
+        """Logs a decision when skipping an agent due to exhausted resources."""
+        mgr, mock_gh = self._make_manager()
+        mock_allocator = MagicMock()
+
+        def list_resources_side_effect(resource_type=None, available_only=False):
+            if available_only:
+                return []
+            return [MagicMock()]
+
+        mock_allocator.list_resources.side_effect = list_resources_side_effect
+        mock_allocator_cls.return_value = mock_allocator
+
+        mock_gh.list_issues.return_value = []
+
+        mgr.replenish_queues(min_ready=2)
+
+        # Should have logged a "Queue Replenishment Skipped" decision for each agent
+        skip_calls = [
+            c for c in mock_log.call_args_list
+            if c[0][0] == "Queue Replenishment Skipped"
+        ]
+        assert len(skip_calls) == 3  # researcher, builder, kimi
+
+    # ------------------------------------------------------------------
+    # replenish_queues works normally when resources available
+    # ------------------------------------------------------------------
+
+    @patch("auto_manager.RESOURCE_AWARE", True)
+    @patch("auto_manager.ResourceAllocator")
+    @patch("auto_manager._log_decision")
+    def test_replenish_queues_proceeds_when_resources_available(self, mock_log, mock_allocator_cls):
+        """replenish_queues promotes backlog when resources are available."""
+        mgr, mock_gh = self._make_manager()
+        mock_allocator = MagicMock()
+        mock_allocator.list_resources.return_value = [MagicMock()]  # resources available
+        mock_allocator_cls.return_value = mock_allocator
+
+        ready_issues = []
+        backlog_issues = [
+            self._make_issue_obj(10, "Backlog1", labels=["research", "status:backlog", "P1"]),
+            self._make_issue_obj(11, "Backlog2", labels=["research", "status:backlog", "P0"]),
+        ]
+
+        def list_issues_side_effect(labels=None, state="open", **kwargs):
+            if labels and "status:ready" in labels:
+                return ready_issues
+            if labels and "status:backlog" in labels:
+                return backlog_issues
+            return []
+
+        mock_gh.list_issues.side_effect = list_issues_side_effect
+
+        mgr.replenish_queues(min_ready=2)
+
+        # Should have promoted backlog items
+        assert mock_gh.transition_status.call_count >= 2
+
+    # ------------------------------------------------------------------
+    # _get_resource_status returns None when not RESOURCE_AWARE
+    # ------------------------------------------------------------------
+
+    @patch("auto_manager.RESOURCE_AWARE", False)
+    @patch("auto_manager._log_decision")
+    def test_get_resource_status_returns_none_when_not_aware(self, mock_log):
+        """_get_resource_status returns None when RESOURCE_AWARE is False."""
+        mgr, mock_gh = self._make_manager()
+        assert mgr._get_resource_status() is None
+
+    # ------------------------------------------------------------------
+    # Dashboard shows resource status section
+    # ------------------------------------------------------------------
+
+    @patch("auto_manager.RESOURCE_AWARE", False)
+    @patch("auto_manager._log_decision")
+    def test_dashboard_shows_resource_section_not_available(self, mock_log):
+        """Dashboard shows 'not available' when RESOURCE_AWARE is False."""
+        mgr, mock_gh = self._make_manager()
+        mock_gh.list_issues.return_value = []
+        mock_gh.get_comments.return_value = []
+
+        result = mgr.dashboard()
+
+        assert "RESOURCE STATUS" in result
+        assert "resource tracking not available" in result
+
+    @patch("auto_manager.RESOURCE_AWARE", True)
+    @patch("auto_manager.ResourceAllocator")
+    @patch("auto_manager._log_decision")
+    def test_dashboard_shows_resource_availability(self, mock_log, mock_allocator_cls):
+        """Dashboard shows resource availability when RESOURCE_AWARE is True."""
+        mgr, mock_gh = self._make_manager()
+        mock_gh.list_issues.return_value = []
+        mock_gh.get_comments.return_value = []
+
+        from auto_manager import ResourceType
+        mock_allocator = MagicMock()
+
+        def list_resources_side_effect(resource_type=None, available_only=False):
+            if resource_type == ResourceType.CLAUDE_SUB:
+                if available_only:
+                    return [MagicMock()]
+                return [MagicMock(), MagicMock()]
+            return []
+
+        mock_allocator.list_resources.side_effect = list_resources_side_effect
+        mock_allocator_cls.return_value = mock_allocator
+
+        result = mgr.dashboard()
+
+        assert "RESOURCE STATUS" in result
+        assert "AVAILABLE" in result or "available" in result
